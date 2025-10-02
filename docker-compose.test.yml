@@ -1,0 +1,35 @@
+services:
+  localstack:
+    image: localstack/localstack:latest
+    container_name: taskfly-localstack-test
+    ports:
+      - "4566:4566"
+    environment:
+      - SERVICES=ec2,iam,sts,ssm
+      - DEBUG=1
+      - AWS_ACCESS_KEY_ID=test
+      - AWS_SECRET_ACCESS_KEY=test
+      - AWS_DEFAULT_REGION=us-east-1
+      # Modern Docker Desktop compatibility
+      - DOCKER_HOST=unix:///var/run/docker.sock
+      - LOCALSTACK_HOST=localhost:4566
+      # Disable Lambda Docker network for compatibility
+      - LAMBDA_DOCKER_NETWORK=host
+      # Disable IPv6 which can cause issues on some systems
+      - DISABLE_EVENTS=1
+      # Don't persist data to avoid volume conflicts
+      - PERSISTENCE=0
+    volumes:
+      - "/var/run/docker.sock:/var/run/docker.sock"
+    networks:
+      - taskfly-test
+    healthcheck:
+      test: ["CMD-SHELL", "curl -f http://localhost:4566/_localstack/health || exit 1"]
+      interval: 10s
+      timeout: 5s
+      retries: 5
+      start_period: 10s
+
+networks:
+  taskfly-test:
+    driver: bridge

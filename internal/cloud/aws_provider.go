@@ -2,11 +2,7 @@ package cloud
 
 import (
 	"context"
-	_ "embed"
-	"encoding/base64"
 	"fmt"
-	"strings"
-	"text/template"
 	"time"
 
 	"github.com/aws/aws-sdk-go-v2/aws"
@@ -15,13 +11,13 @@ import (
 	"github.com/aws/aws-sdk-go-v2/service/ec2/types"
 )
 
-//go:embed scripts/aws_bootstrap.sh
-var awsBootstrapScript string
+// AWS provider uses SSH to deploy agent binaries directly
 
 // AWSProvider implements the Provider interface for AWS EC2
 type AWSProvider struct {
-	client *ec2.Client
-	config map[string]interface{}
+	client       *ec2.Client
+	config       map[string]interface{}
+	configHelper *ProviderConfigHelper
 }
 
 // NewAWSProvider creates a new AWS provider
@@ -80,8 +76,9 @@ func NewAWSProvider(providerConfig map[string]interface{}) (*AWSProvider, error)
 	}
 
 	return &AWSProvider{
-		client: ec2.NewFromConfig(cfg),
-		config: providerConfig,
+		client:       ec2.NewFromConfig(cfg),
+		config:       providerConfig,
+		configHelper: NewProviderConfigHelper(providerConfig),
 	}, nil
 }
 
@@ -93,18 +90,22 @@ func (p *AWSProvider) GetProviderName() string {
 // ProvisionInstance creates a new EC2 instance
 func (p *AWSProvider) ProvisionInstance(ctx context.Context, config InstanceConfig) (*InstanceInfo, error) {
 	// Get configuration values with defaults
-	imageID := p.getConfigString("image_id", "no-default") // Default to Amazon Linux 2
-	instanceType := p.getConfigString("instance_type", "no-default")
-	keyName := p.getConfigString("key_name", "")
-	securityGroups := p.getConfigStringSlice("security_groups", []string{"default"})
-	subnetID := p.getConfigString("subnet_id", "")
+	imageID := p.configHelper.GetString("image_id", "no-default")
+	instanceType := p.configHelper.GetString("instance_type", "no-default")
+	keyName := p.configHelper.GetString("key_name", "")
+	securityGroups := p.configHelper.GetStringSlice("security_groups", []string{"default"})
+	subnetID := p.configHelper.GetString("subnet_id", "")
 
 	if keyName == "" {
 		return nil, fmt.Errorf("key_name is required for AWS provider")
 	}
 
-	// Create user data script for bootstrap
-	userData := p.createUserData(config)
+	// Get SSH configuration for agent deployment
+	sshUser := p.configHelper.GetString("ssh_user", "ec2-user") // Default for Amazon Linux
+	sshKeyPath := p.configHelper.GetString("ssh_key_path", "")
+	if sshKeyPath == "" {
+		return nil, fmt.Errorf("ssh_key_path is required for AWS provider")
+	}
 
 	// Prepare run instances input
 	runInput := &ec2.RunInstancesInput{
@@ -113,7 +114,6 @@ func (p *AWSProvider) ProvisionInstance(ctx context.Context, config InstanceConf
 		KeyName:      aws.String(keyName),
 		MinCount:     aws.Int32(1),
 		MaxCount:     aws.Int32(1),
-		UserData:     aws.String(userData),
 		SecurityGroups: func() []string {
 			if subnetID != "" {
 				return nil // Use SecurityGroupIds for VPC
@@ -177,6 +177,28 @@ func (p *AWSProvider) ProvisionInstance(ctx context.Context, config InstanceConf
 		return nil, fmt.Errorf("failed to get instance info: %w", err)
 	}
 
+	// Detect architecture from instance type
+	arch := DetectArchFromInstanceType(instanceType)
+	fmt.Printf("Detected architecture %s for instance type %s\n", arch, instanceType)
+
+	// Deploy agent using unified deployment function
+	deployConfig := DeploymentConfig{
+		Host:           instanceInfo.IPAddress,
+		SSHUser:        sshUser,
+		SSHKeyPath:     sshKeyPath,
+		SSHPort:        22,
+		ProvisionToken: config.ProvisionToken,
+		DaemonURL:      config.DaemonURL,
+		TargetOS:       "linux",
+		TargetArch:     arch,
+		WaitForSSH:     true,
+		SSHTimeout:     5 * time.Minute,
+	}
+
+	if err := DeployAgentToHost(deployConfig); err != nil {
+		return nil, fmt.Errorf("failed to deploy agent: %w", err)
+	}
+
 	return instanceInfo, nil
 }
 
@@ -211,61 +233,6 @@ func (p *AWSProvider) TerminateInstance(ctx context.Context, instanceID string) 
 	}
 
 	return nil
-}
-
-// getConfigString gets a string configuration value with a default
-func (p *AWSProvider) getConfigString(key, defaultValue string) string {
-	if value, ok := p.config[key].(string); ok {
-		return value
-	}
-	return defaultValue
-}
-
-// getConfigStringSlice gets a string slice configuration value with a default
-func (p *AWSProvider) getConfigStringSlice(key string, defaultValue []string) []string {
-	if value, ok := p.config[key].([]interface{}); ok {
-		result := make([]string, len(value))
-		for i, v := range value {
-			if str, ok := v.(string); ok {
-				result[i] = str
-			}
-		}
-		return result
-	}
-	return defaultValue
-}
-
-// createUserData creates the EC2 user data script for bootstrapping
-func (p *AWSProvider) createUserData(config InstanceConfig) string {
-	// Create template data
-	templateData := struct {
-		ProvisionToken string
-		DaemonURL      string
-		NodeConfig     map[string]interface{}
-	}{
-		ProvisionToken: config.ProvisionToken,
-		DaemonURL:      config.DaemonURL,
-		NodeConfig:     config.NodeConfig,
-	}
-
-	// Parse and execute template
-	tmpl, err := template.New("bootstrap").Parse(awsBootstrapScript)
-	if err != nil {
-		// Fallback to simple string replacement if template parsing fails
-		script := strings.ReplaceAll(awsBootstrapScript, "{{.ProvisionToken}}", config.ProvisionToken)
-		script = strings.ReplaceAll(script, "{{.DaemonURL}}", config.DaemonURL)
-		return base64.StdEncoding.EncodeToString([]byte(script))
-	}
-
-	var buf strings.Builder
-	if err := tmpl.Execute(&buf, templateData); err != nil {
-		// Fallback to simple string replacement if template execution fails
-		script := strings.ReplaceAll(awsBootstrapScript, "{{.ProvisionToken}}", config.ProvisionToken)
-		script = strings.ReplaceAll(script, "{{.DaemonURL}}", config.DaemonURL)
-		return base64.StdEncoding.EncodeToString([]byte(script))
-	}
-
-	return base64.StdEncoding.EncodeToString([]byte(buf.String()))
 }
 
 // waitForInstanceRunning waits for an instance to be in running state

@@ -2,6 +2,10 @@
 deployments/*
 !deployments/.gitkeep
 
+# Build artifacts
+build/
+bin/
+
 # OS generated files
 .DS_Store
 .DS_Store?

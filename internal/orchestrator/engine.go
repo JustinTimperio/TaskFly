@@ -32,14 +32,14 @@ type TaskFlyConfig struct {
 
 // Orchestrator manages the deployment lifecycle
 type Orchestrator struct {
-	store      *state.Store
+	store      state.StateStore
 	workingDir string
 	logger     *logrus.Logger
 	daemonURL  string
 }
 
 // NewOrchestrator creates a new orchestrator instance
-func NewOrchestrator(store *state.Store, workingDir string, daemonURL string) *Orchestrator {
+func NewOrchestrator(store state.StateStore, workingDir string, daemonURL string) *Orchestrator {
 	logger := logrus.New()
 	logger.SetLevel(logrus.InfoLevel)
 
@@ -378,34 +378,34 @@ func (o *Orchestrator) createWorkerBundle(extractDir, workerBundlePath string) e
 func (o *Orchestrator) TerminateDeployment(deploymentID string) error {
 	o.logger.Infof("Terminating deployment %s", deploymentID)
 
-	// Update deployment status
-	if err := o.store.UpdateDeploymentStatus(deploymentID, state.StatusTerminating); err != nil {
-		return fmt.Errorf("failed to update deployment status: %w", err)
-	}
-
-	// Get all nodes for this deployment
+	// Get all nodes for this deployment before deletion
 	nodes, err := o.store.GetNodesByDeployment(deploymentID)
 	if err != nil {
 		return fmt.Errorf("failed to get nodes: %w", err)
 	}
 
-	// Terminate all nodes
+	// Mark all nodes for shutdown so agents receive shutdown signal in heartbeat
 	for _, node := range nodes {
-		o.logger.Infof("Terminating node %s (instance: %s)", node.NodeID, node.InstanceID)
-		// Immediately mark as terminated since we're not doing graceful shutdown yet
-		// In Phase 3, this will actually terminate cloud instances
-		o.store.UpdateNodeStatus(node.DeploymentID, node.NodeID, state.NodeStatusTerminated)
+		o.logger.Infof("Marking node %s for shutdown (instance: %s)", node.NodeID, node.InstanceID)
+		if err := o.store.MarkNodeForShutdown(node.DeploymentID, node.NodeID); err != nil {
+			o.logger.Errorf("Failed to mark node %s for shutdown: %v", node.NodeID, err)
+		}
 	}
 
-	// Update deployment status immediately
-	o.store.UpdateDeploymentStatus(deploymentID, state.StatusTerminated)
-	o.logger.Infof("Deployment %s terminated", deploymentID)
-
-	// Cleanup files in background
+	// Wait a bit for agents to receive shutdown signal, then cleanup
 	go func() {
-		time.Sleep(2 * time.Second)
+		// Give agents 10 seconds to receive shutdown signal and gracefully terminate
+		time.Sleep(10 * time.Second)
+
 		o.cleanupDeploymentFiles(deploymentID)
 		o.logger.Infof("Deployment %s files cleaned up", deploymentID)
+
+		// Delete deployment from state store (removes from state.json)
+		if err := o.store.DeleteDeployment(deploymentID); err != nil {
+			o.logger.Errorf("Failed to delete deployment %s from state: %v", deploymentID, err)
+		} else {
+			o.logger.Infof("Deployment %s removed from state", deploymentID)
+		}
 	}()
 
 	return nil

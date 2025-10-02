@@ -5,9 +5,9 @@ instance_config:
     ssh_user: "user"  # Update this to your actual SSH username
     ssh_key_path: "~/.ssh/id_ed25519"  # Update this to your actual SSH key path
     hosts:
-      - "192.168.0.10"
-      - "192.168.0.11"  
-      - "192.168.0.12"
+      - "192.168.50.14"
+      - "192.168.50.194"  
+      - "192.168.50.236"
 
 # Enhanced multi-node configuration with dynamic metadata
 nodes:

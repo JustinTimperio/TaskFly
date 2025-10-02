@@ -1,111 +1,122 @@
 package state
 
 import (
+	"encoding/json"
 	"fmt"
+	"os"
+	"path/filepath"
 	"sync"
 	"time"
 )
 
-// DeploymentStatus represents the current state of a deployment
-type DeploymentStatus string
-
-const (
-	StatusPending      DeploymentStatus = "pending"
-	StatusProvisioning DeploymentStatus = "provisioning"
-	StatusRunning      DeploymentStatus = "running"
-	StatusCompleted    DeploymentStatus = "completed"
-	StatusFailed       DeploymentStatus = "failed"
-	StatusTerminating  DeploymentStatus = "terminating"
-	StatusTerminated   DeploymentStatus = "terminated"
-)
-
-// NodeStatus represents the current state of a node
-type NodeStatus string
-
-const (
-	NodeStatusPending      NodeStatus = "pending"
-	NodeStatusProvisioning NodeStatus = "provisioning"
-	NodeStatusBooting      NodeStatus = "booting"
-	NodeStatusRegistering  NodeStatus = "registering"
-	NodeStatusDownloading  NodeStatus = "downloading_assets"
-	NodeStatusRunning      NodeStatus = "running_script"
-	NodeStatusCompleted    NodeStatus = "completed"
-	NodeStatusFailed       NodeStatus = "failed"
-	NodeStatusTerminating  NodeStatus = "terminating"
-	NodeStatusTerminated   NodeStatus = "terminated"
-)
-
-// Node represents a single node in a deployment
-type Node struct {
-	NodeID         string                 `json:"node_id"`
-	NodeIndex      int                    `json:"node_index"`
-	DeploymentID   string                 `json:"deployment_id"`
-	Status         NodeStatus             `json:"status"`
-	IPAddress      string                 `json:"ip_address,omitempty"`
-	InstanceID     string                 `json:"instance_id,omitempty"`
-	Config         map[string]interface{} `json:"config"`
-	ProvisionToken string                 `json:"provision_token,omitempty"`
-	AuthToken      string                 `json:"auth_token,omitempty"`
-	ShouldShutdown bool                   `json:"should_shutdown"`
-	LastUpdate     time.Time              `json:"last_update"`
-	ErrorMessage   string                 `json:"error_message,omitempty"`
-}
-
-// Deployment represents a complete deployment with all its nodes
-type Deployment struct {
-	ID             string                 `json:"deployment_id"`
-	Status         DeploymentStatus       `json:"status"`
-	CloudProvider  string                 `json:"cloud_provider"`
-	TotalNodes     int                    `json:"total_nodes"`
-	NodesCompleted int                    `json:"nodes_completed"`
-	NodesFailed    int                    `json:"nodes_failed"`
-	BundlePath     string                 `json:"bundle_path,omitempty"`
-	Config         map[string]interface{} `json:"config,omitempty"`
-	CreatedAt      time.Time              `json:"created_at"`
-	UpdatedAt      time.Time              `json:"updated_at"`
-	CompletedAt    *time.Time             `json:"completed_at,omitempty"`
-	ErrorMessage   string                 `json:"error_message,omitempty"`
-}
-
-// StateStore defines the interface for state storage implementations
-type StateStore interface {
-	CreateDeployment(deployment *Deployment) error
-	FindNodeByAuthToken(authToken string) (*Node, *Deployment, error)
-	GetDeployment(deploymentID string) (*Deployment, error)
-	GetAllDeployments() []*Deployment
-	UpdateDeploymentStatus(deploymentID string, status DeploymentStatus, errorMessage ...string) error
-	CreateNode(node *Node) error
-	GetNode(nodeID string) (*Node, error)
-	GetNodesByDeployment(deploymentID string) ([]*Node, error)
-	UpdateNodeStatus(deploymentID, nodeID string, status NodeStatus, errorMessage ...string) error
-	UpdateNodeAuthToken(deploymentID, nodeID, authToken string) error
-	UpdateNodeLastSeen(deploymentID, nodeID string) error
-	UpdateNodeMessage(deploymentID, nodeID, message string) error
-	UpdateNodeInstanceInfo(deploymentID, nodeID, instanceID, ipAddress string) error
-	MarkNodeForShutdown(deploymentID, nodeID string) error
-	DeleteDeployment(deploymentID string) error
-	GetStats() map[string]interface{}
-}
-
-// Store manages all deployment and node state in memory
-type Store struct {
+// DiskStore implements persistent state storage using JSON files
+type DiskStore struct {
 	mu          sync.RWMutex
 	deployments map[string]*Deployment
-	nodes       map[string]*Node   // key is node_id
-	nodesByDep  map[string][]*Node // key is deployment_id
+	nodes       map[string]*Node
+	nodesByDep  map[string][]*Node
+	dataDir     string
 }
 
-// NewStore creates a new in-memory state store
-func NewStore() *Store {
-	return &Store{
+// persisted state structure for JSON serialization
+type persistedState struct {
+	Deployments map[string]*Deployment `json:"deployments"`
+	Nodes       map[string]*Node       `json:"nodes"`
+}
+
+// NewDiskStore creates a new disk-backed state store
+func NewDiskStore(dataDir string) (*DiskStore, error) {
+	// Create data directory if it doesn't exist
+	if err := os.MkdirAll(dataDir, 0755); err != nil {
+		return nil, fmt.Errorf("failed to create data directory: %w", err)
+	}
+
+	store := &DiskStore{
 		deployments: make(map[string]*Deployment),
 		nodes:       make(map[string]*Node),
 		nodesByDep:  make(map[string][]*Node),
+		dataDir:     dataDir,
 	}
+
+	// Load existing state from disk
+	if err := store.load(); err != nil {
+		return nil, fmt.Errorf("failed to load state: %w", err)
+	}
+
+	return store, nil
 }
 
-// CreateDeployment creates a new deployment record
-func (s *Store) CreateDeployment(deployment *Deployment) error {
+// load reads state from disk
+func (s *DiskStore) load() error {
+	stateFile := filepath.Join(s.dataDir, "state.json")
+
+	// Check if state file exists
+	if _, err := os.Stat(stateFile); os.IsNotExist(err) {
+		// No state file yet, start fresh
+		return nil
+	}
+
+	data, err := os.ReadFile(stateFile)
+	if err != nil {
+		return fmt.Errorf("failed to read state file: %w", err)
+	}
+
+	var state persistedState
+	if err := json.Unmarshal(data, &state); err != nil {
+		return fmt.Errorf("failed to unmarshal state: %w", err)
+	}
+
+	// Restore deployments
+	s.deployments = state.Deployments
+	if s.deployments == nil {
+		s.deployments = make(map[string]*Deployment)
+	}
+
+	// Restore nodes
+	s.nodes = state.Nodes
+	if s.nodes == nil {
+		s.nodes = make(map[string]*Node)
+	}
+
+	// Rebuild nodesByDep index
+	s.nodesByDep = make(map[string][]*Node)
+	for _, node := range s.nodes {
+		s.nodesByDep[node.DeploymentID] = append(s.nodesByDep[node.DeploymentID], node)
+	}
+
+	return nil
+}
+
+// save writes current state to disk
+func (s *DiskStore) save() error {
+	state := persistedState{
+		Deployments: s.deployments,
+		Nodes:       s.nodes,
+	}
+
+	data, err := json.MarshalIndent(state, "", "  ")
+	if err != nil {
+		return fmt.Errorf("failed to marshal state: %w", err)
+	}
+
+	stateFile := filepath.Join(s.dataDir, "state.json")
+	tempFile := stateFile + ".tmp"
+
+	// Write to temp file first
+	if err := os.WriteFile(tempFile, data, 0644); err != nil {
+		return fmt.Errorf("failed to write temp state file: %w", err)
+	}
+
+	// Atomic rename
+	if err := os.Rename(tempFile, stateFile); err != nil {
+		return fmt.Errorf("failed to rename state file: %w", err)
+	}
+
+	return nil
+}
+
+// CreateDeployment creates a new deployment record and persists to disk
+func (s *DiskStore) CreateDeployment(deployment *Deployment) error {
 	s.mu.Lock()
 	defer s.mu.Unlock()
 
@@ -118,11 +129,11 @@ func (s *Store) CreateDeployment(deployment *Deployment) error {
 	s.deployments[deployment.ID] = deployment
 	s.nodesByDep[deployment.ID] = make([]*Node, 0)
 
-	return nil
+	return s.save()
 }
 
 // FindNodeByAuthToken finds a node and its deployment by auth token
-func (s *Store) FindNodeByAuthToken(authToken string) (*Node, *Deployment, error) {
+func (s *DiskStore) FindNodeByAuthToken(authToken string) (*Node, *Deployment, error) {
 	s.mu.RLock()
 	defer s.mu.RUnlock()
 
@@ -145,7 +156,7 @@ func (s *Store) FindNodeByAuthToken(authToken string) (*Node, *Deployment, error
 }
 
 // GetDeployment retrieves a deployment by ID
-func (s *Store) GetDeployment(deploymentID string) (*Deployment, error) {
+func (s *DiskStore) GetDeployment(deploymentID string) (*Deployment, error) {
 	s.mu.RLock()
 	defer s.mu.RUnlock()
 
@@ -154,19 +165,17 @@ func (s *Store) GetDeployment(deploymentID string) (*Deployment, error) {
 		return nil, fmt.Errorf("deployment %s not found", deploymentID)
 	}
 
-	// Create a copy to avoid race conditions
 	depCopy := *deployment
 	return &depCopy, nil
 }
 
 // GetAllDeployments returns all deployments
-func (s *Store) GetAllDeployments() []*Deployment {
+func (s *DiskStore) GetAllDeployments() []*Deployment {
 	s.mu.RLock()
 	defer s.mu.RUnlock()
 
 	deployments := make([]*Deployment, 0, len(s.deployments))
 	for _, dep := range s.deployments {
-		// Create copies to avoid race conditions
 		depCopy := *dep
 		deployments = append(deployments, &depCopy)
 	}
@@ -174,8 +183,8 @@ func (s *Store) GetAllDeployments() []*Deployment {
 	return deployments
 }
 
-// UpdateDeploymentStatus updates the status of a deployment
-func (s *Store) UpdateDeploymentStatus(deploymentID string, status DeploymentStatus, errorMessage ...string) error {
+// UpdateDeploymentStatus updates the status of a deployment and persists to disk
+func (s *DiskStore) UpdateDeploymentStatus(deploymentID string, status DeploymentStatus, errorMessage ...string) error {
 	s.mu.Lock()
 	defer s.mu.Unlock()
 
@@ -196,11 +205,11 @@ func (s *Store) UpdateDeploymentStatus(deploymentID string, status DeploymentSta
 		deployment.CompletedAt = &now
 	}
 
-	return nil
+	return s.save()
 }
 
-// CreateNode creates a new node record
-func (s *Store) CreateNode(node *Node) error {
+// CreateNode creates a new node record and persists to disk
+func (s *DiskStore) CreateNode(node *Node) error {
 	s.mu.Lock()
 	defer s.mu.Unlock()
 
@@ -212,11 +221,11 @@ func (s *Store) CreateNode(node *Node) error {
 	s.nodes[node.NodeID] = node
 	s.nodesByDep[node.DeploymentID] = append(s.nodesByDep[node.DeploymentID], node)
 
-	return nil
+	return s.save()
 }
 
 // GetNode retrieves a node by ID
-func (s *Store) GetNode(nodeID string) (*Node, error) {
+func (s *DiskStore) GetNode(nodeID string) (*Node, error) {
 	s.mu.RLock()
 	defer s.mu.RUnlock()
 
@@ -225,13 +234,12 @@ func (s *Store) GetNode(nodeID string) (*Node, error) {
 		return nil, fmt.Errorf("node %s not found", nodeID)
 	}
 
-	// Create a copy to avoid race conditions
 	nodeCopy := *node
 	return &nodeCopy, nil
 }
 
 // GetNodesByDeployment returns all nodes for a deployment
-func (s *Store) GetNodesByDeployment(deploymentID string) ([]*Node, error) {
+func (s *DiskStore) GetNodesByDeployment(deploymentID string) ([]*Node, error) {
 	s.mu.RLock()
 	defer s.mu.RUnlock()
 
@@ -240,7 +248,6 @@ func (s *Store) GetNodesByDeployment(deploymentID string) ([]*Node, error) {
 		return nil, fmt.Errorf("deployment %s not found", deploymentID)
 	}
 
-	// Create copies to avoid race conditions
 	nodesCopy := make([]*Node, len(nodes))
 	for i, node := range nodes {
 		nodeCopy := *node
@@ -250,8 +257,8 @@ func (s *Store) GetNodesByDeployment(deploymentID string) ([]*Node, error) {
 	return nodesCopy, nil
 }
 
-// UpdateNodeStatus updates the status of a node
-func (s *Store) UpdateNodeStatus(deploymentID, nodeID string, status NodeStatus, errorMessage ...string) error {
+// UpdateNodeStatus updates the status of a node and persists to disk
+func (s *DiskStore) UpdateNodeStatus(deploymentID, nodeID string, status NodeStatus, errorMessage ...string) error {
 	s.mu.Lock()
 	defer s.mu.Unlock()
 
@@ -273,11 +280,11 @@ func (s *Store) UpdateNodeStatus(deploymentID, nodeID string, status NodeStatus,
 	// Update deployment completion counts and status
 	s.checkDeploymentCompletion(deploymentID)
 
-	return nil
+	return s.save()
 }
 
-// UpdateNodeAuthToken updates the auth token of a node
-func (s *Store) UpdateNodeAuthToken(deploymentID, nodeID, authToken string) error {
+// UpdateNodeAuthToken updates the auth token of a node and persists to disk
+func (s *DiskStore) UpdateNodeAuthToken(deploymentID, nodeID, authToken string) error {
 	s.mu.Lock()
 	defer s.mu.Unlock()
 
@@ -292,11 +299,12 @@ func (s *Store) UpdateNodeAuthToken(deploymentID, nodeID, authToken string) erro
 
 	node.AuthToken = authToken
 	node.LastUpdate = time.Now()
-	return nil
+
+	return s.save()
 }
 
-// UpdateNodeLastSeen updates the last seen time of a node
-func (s *Store) UpdateNodeLastSeen(deploymentID, nodeID string) error {
+// UpdateNodeLastSeen updates the last seen time of a node and persists to disk
+func (s *DiskStore) UpdateNodeLastSeen(deploymentID, nodeID string) error {
 	s.mu.Lock()
 	defer s.mu.Unlock()
 
@@ -310,11 +318,12 @@ func (s *Store) UpdateNodeLastSeen(deploymentID, nodeID string) error {
 	}
 
 	node.LastUpdate = time.Now()
-	return nil
+
+	return s.save()
 }
 
-// UpdateNodeMessage updates the message of a node
-func (s *Store) UpdateNodeMessage(deploymentID, nodeID, message string) error {
+// UpdateNodeMessage updates the message of a node and persists to disk
+func (s *DiskStore) UpdateNodeMessage(deploymentID, nodeID, message string) error {
 	s.mu.Lock()
 	defer s.mu.Unlock()
 
@@ -329,11 +338,12 @@ func (s *Store) UpdateNodeMessage(deploymentID, nodeID, message string) error {
 
 	node.ErrorMessage = message
 	node.LastUpdate = time.Now()
-	return nil
+
+	return s.save()
 }
 
-// UpdateNodeInstanceInfo updates the instance ID and IP address of a node
-func (s *Store) UpdateNodeInstanceInfo(deploymentID, nodeID, instanceID, ipAddress string) error {
+// UpdateNodeInstanceInfo updates the instance ID and IP address of a node and persists to disk
+func (s *DiskStore) UpdateNodeInstanceInfo(deploymentID, nodeID, instanceID, ipAddress string) error {
 	s.mu.Lock()
 	defer s.mu.Unlock()
 
@@ -349,11 +359,12 @@ func (s *Store) UpdateNodeInstanceInfo(deploymentID, nodeID, instanceID, ipAddre
 	node.InstanceID = instanceID
 	node.IPAddress = ipAddress
 	node.LastUpdate = time.Now()
-	return nil
+
+	return s.save()
 }
 
-// MarkNodeForShutdown marks a node to be shut down
-func (s *Store) MarkNodeForShutdown(deploymentID, nodeID string) error {
+// MarkNodeForShutdown marks a node to be shut down and persists to disk
+func (s *DiskStore) MarkNodeForShutdown(deploymentID, nodeID string) error {
 	s.mu.Lock()
 	defer s.mu.Unlock()
 
@@ -368,11 +379,12 @@ func (s *Store) MarkNodeForShutdown(deploymentID, nodeID string) error {
 
 	node.ShouldShutdown = true
 	node.LastUpdate = time.Now()
-	return nil
+
+	return s.save()
 }
 
-// Helper to check if all nodes in a deployment are done
-func (s *Store) checkDeploymentCompletion(deploymentID string) {
+// checkDeploymentCompletion updates deployment status based on node states (must be called with lock held)
+func (s *DiskStore) checkDeploymentCompletion(deploymentID string) {
 	deployment, exists := s.deployments[deploymentID]
 	if !exists {
 		return
@@ -420,8 +432,8 @@ func (s *Store) checkDeploymentCompletion(deploymentID string) {
 	}
 }
 
-// DeleteDeployment removes a deployment and all its nodes from the store
-func (s *Store) DeleteDeployment(deploymentID string) error {
+// DeleteDeployment removes a deployment and all its nodes from the store and persists to disk
+func (s *DiskStore) DeleteDeployment(deploymentID string) error {
 	s.mu.Lock()
 	defer s.mu.Unlock()
 
@@ -442,11 +454,11 @@ func (s *Store) DeleteDeployment(deploymentID string) error {
 	// Remove the deployment
 	delete(s.deployments, deploymentID)
 
-	return nil
+	return s.save()
 }
 
 // GetStats returns basic statistics about the store
-func (s *Store) GetStats() map[string]interface{} {
+func (s *DiskStore) GetStats() map[string]interface{} {
 	s.mu.RLock()
 	defer s.mu.RUnlock()
 

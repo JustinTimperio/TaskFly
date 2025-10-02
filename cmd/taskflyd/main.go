@@ -19,7 +19,7 @@ import (
 
 // Global instances
 var (
-	store         *state.Store
+	store         state.StateStore
 	orch          *orchestrator.Orchestrator
 	logger        *logrus.Logger
 	deploymentDir string
@@ -103,9 +103,17 @@ func runDaemon(c *cli.Context) error {
 	}
 	logger.Infof("Using deployment directory: %s", deploymentDir)
 
-	// Initialize state store
-	store = state.NewStore()
-	logger.Info("State store initialized")
+	// Initialize disk-backed state store
+	homeDir, err := os.UserHomeDir()
+	if err != nil {
+		logger.Fatalf("Failed to get user home directory: %v", err)
+	}
+	stateDir := filepath.Join(homeDir, ".taskfly", "state")
+	store, err = state.NewDiskStore(stateDir)
+	if err != nil {
+		logger.Fatalf("Failed to initialize state store: %v", err)
+	}
+	logger.Infof("State store initialized at %s", stateDir)
 
 	// Initialize orchestrator
 	orch = orchestrator.NewOrchestrator(store, deploymentDir, daemonIP)
@@ -520,7 +528,11 @@ func nodeHeartbeat(c echo.Context) error {
 		}
 	}
 
-	return c.JSON(http.StatusOK, map[string]string{"status": "ok"})
+	// Return shutdown signal if node should shutdown
+	return c.JSON(http.StatusOK, map[string]interface{}{
+		"status":   "ok",
+		"shutdown": node.ShouldShutdown,
+	})
 }
 
 func updateNodeStatus(c echo.Context) error {

@@ -2,6 +2,7 @@ package main
 
 import (
 	"archive/tar"
+	"bufio"
 	"bytes"
 	"compress/gzip"
 	"context"
@@ -15,6 +16,8 @@ import (
 	"os/exec"
 	"os/signal"
 	"path/filepath"
+	"strings"
+	"sync"
 	"syscall"
 	"time"
 )
@@ -30,16 +33,39 @@ type Config struct {
 }
 
 type RegistrationResponse struct {
-	NodeID       string `json:"node_id"`
-	AuthToken    string `json:"auth_token"`
-	AssetsURL    string `json:"assets_url"`
-	StatusURL    string `json:"status_url"`
-	HeartbeatURL string `json:"heartbeat_url"`
+	NodeID       string                 `json:"node_id"`
+	AuthToken    string                 `json:"auth_token"`
+	AssetsURL    string                 `json:"assets_url"`
+	StatusURL    string                 `json:"status_url"`
+	HeartbeatURL string                 `json:"heartbeat_url"`
+	LogsURL      string                 `json:"logs_url"`
+	Config       map[string]interface{} `json:"config"`
 }
 
 type StatusUpdate struct {
 	Status  string `json:"status"`
 	Message string `json:"message"`
+}
+
+type SystemMetrics struct {
+	CPUCores    int     `json:"cpu_cores"`
+	CPUUsage    float64 `json:"cpu_usage"`    // percentage
+	MemoryTotal uint64  `json:"memory_total"` // bytes
+	MemoryUsed  uint64  `json:"memory_used"`  // bytes
+	LoadAvg1    float64 `json:"load_avg_1"`   // 1 minute load average
+	LoadAvg5    float64 `json:"load_avg_5"`   // 5 minute load average
+	LoadAvg15   float64 `json:"load_avg_15"`  // 15 minute load average
+}
+
+type Heartbeat struct {
+	Metrics *SystemMetrics `json:"metrics,omitempty"`
+}
+
+type LogEntry struct {
+	Timestamp time.Time `json:"timestamp"`
+	NodeID    string    `json:"node_id"`
+	Message   string    `json:"message"`
+	Stream    string    `json:"stream"` // "stdout" or "stderr"
 }
 
 type Agent struct {
@@ -48,11 +74,15 @@ type Agent struct {
 	authToken    string
 	statusURL    string
 	heartbeatURL string
+	logsURL      string
+	nodeConfig   map[string]interface{}
 	client       *http.Client
 	workDir      string
 	setupCmd     *exec.Cmd
 	ctx          context.Context
 	cancel       context.CancelFunc
+	logBuffer    []LogEntry
+	logMutex     sync.Mutex
 }
 
 func main() {
@@ -116,6 +146,9 @@ func (a *Agent) Run() error {
 	// Start heartbeat goroutine
 	go a.heartbeatLoop()
 
+	// Start log pushing goroutine
+	go a.logPushLoop()
+
 	// Download bundle
 	if err := a.updateStatus("downloading_assets", "Downloading deployment bundle"); err != nil {
 		log.Printf("Failed to update status: %v", err)
@@ -140,7 +173,7 @@ func (a *Agent) Run() error {
 	// Execute setup script if it exists
 	setupScript := filepath.Join(a.workDir, "setup.sh")
 	if _, err := os.Stat(setupScript); err == nil {
-		if err := a.updateStatus("running", "Executing deployment script"); err != nil {
+		if err := a.updateStatus("running_script", "Executing deployment script"); err != nil {
 			log.Printf("Failed to update status: %v", err)
 		}
 
@@ -212,6 +245,16 @@ func (a *Agent) register() error {
 	a.authToken = regResp.AuthToken
 	a.statusURL = regResp.StatusURL
 	a.heartbeatURL = regResp.HeartbeatURL
+	a.nodeConfig = regResp.Config
+
+	// Set logs URL (construct if not provided for backward compatibility)
+	if regResp.LogsURL != "" {
+		a.logsURL = regResp.LogsURL
+	} else {
+		a.logsURL = fmt.Sprintf("%s/api/v1/nodes/logs", a.config.DaemonURL)
+	}
+
+	log.Printf("Received node configuration with %d keys", len(a.nodeConfig))
 
 	return nil
 }
@@ -256,7 +299,7 @@ func (a *Agent) heartbeatLoop() {
 		return
 	}
 
-	ticker := time.NewTicker(30 * time.Second)
+	ticker := time.NewTicker(3 * time.Second)
 	defer ticker.Stop()
 
 	for {
@@ -272,11 +315,24 @@ func (a *Agent) heartbeatLoop() {
 }
 
 func (a *Agent) sendHeartbeat() error {
-	req, err := http.NewRequestWithContext(a.ctx, "POST", a.heartbeatURL, nil)
+	// Collect system metrics
+	metrics := a.collectMetrics()
+
+	hb := Heartbeat{
+		Metrics: metrics,
+	}
+
+	data, err := json.Marshal(hb)
+	if err != nil {
+		return fmt.Errorf("failed to marshal heartbeat: %w", err)
+	}
+
+	req, err := http.NewRequestWithContext(a.ctx, "POST", a.heartbeatURL, bytes.NewReader(data))
 	if err != nil {
 		return fmt.Errorf("failed to create heartbeat request: %w", err)
 	}
 
+	req.Header.Set("Content-Type", "application/json")
 	req.Header.Set("Authorization", fmt.Sprintf("Bearer %s", a.authToken))
 
 	resp, err := a.client.Do(req)
@@ -313,6 +369,29 @@ func (a *Agent) sendHeartbeat() error {
 	}
 
 	return nil
+}
+
+func (a *Agent) collectMetrics() *SystemMetrics {
+	metrics := &SystemMetrics{}
+
+	// Get CPU count
+	metrics.CPUCores = a.getCPUCount()
+
+	// Get load averages (Unix-like systems)
+	metrics.LoadAvg1, metrics.LoadAvg5, metrics.LoadAvg15 = a.getLoadAverages()
+
+	// Get memory usage
+	metrics.MemoryTotal, metrics.MemoryUsed = a.getMemoryUsage()
+
+	// Get CPU usage (simple approximation based on load avg)
+	if metrics.CPUCores > 0 {
+		metrics.CPUUsage = (metrics.LoadAvg1 / float64(metrics.CPUCores)) * 100
+		if metrics.CPUUsage > 100 {
+			metrics.CPUUsage = 100
+		}
+	}
+
+	return metrics
 }
 
 func (a *Agent) downloadBundle(path string) error {
@@ -420,20 +499,51 @@ func (a *Agent) executeSetup(scriptPath string) error {
 		return fmt.Errorf("failed to chmod setup script: %w", err)
 	}
 
-	// Create log file for setup output
-	logPath := filepath.Join(a.workDir, "setup.log")
-	logFile, err := os.Create(logPath)
-	if err != nil {
-		return fmt.Errorf("failed to create log file: %w", err)
-	}
-	defer logFile.Close()
-
 	// Execute setup script
 	cmd := exec.CommandContext(a.ctx, scriptPath)
 	cmd.Dir = a.workDir
-	cmd.Stdout = logFile
-	cmd.Stderr = logFile
-	cmd.Env = os.Environ()
+
+	// Start with the current environment
+	env := os.Environ()
+
+	// Add node configuration as environment variables
+	// Convert keys to uppercase for consistency
+	for key, value := range a.nodeConfig {
+		// Convert value to string
+		var strValue string
+		switch v := value.(type) {
+		case string:
+			strValue = v
+		case int, int64, float64, bool:
+			strValue = fmt.Sprintf("%v", v)
+		default:
+			// For complex types, try JSON encoding
+			if jsonBytes, err := json.Marshal(v); err == nil {
+				strValue = string(jsonBytes)
+			} else {
+				strValue = fmt.Sprintf("%v", v)
+			}
+		}
+
+		// Convert key to uppercase for environment variable
+		upperKey := strings.ToUpper(key)
+
+		env = append(env, fmt.Sprintf("%s=%s", upperKey, strValue))
+		log.Printf("Setting env var: %s=%s", upperKey, strValue)
+	}
+
+	cmd.Env = env
+
+	// Capture stdout and stderr
+	stdoutPipe, err := cmd.StdoutPipe()
+	if err != nil {
+		return fmt.Errorf("failed to create stdout pipe: %w", err)
+	}
+
+	stderrPipe, err := cmd.StderrPipe()
+	if err != nil {
+		return fmt.Errorf("failed to create stderr pipe: %w", err)
+	}
 
 	if err := cmd.Start(); err != nil {
 		return fmt.Errorf("failed to start setup script: %w", err)
@@ -441,6 +551,26 @@ func (a *Agent) executeSetup(scriptPath string) error {
 
 	a.setupCmd = cmd
 	log.Printf("Setup script started with PID: %d", cmd.Process.Pid)
+
+	// Stream stdout
+	go func() {
+		scanner := bufio.NewScanner(stdoutPipe)
+		for scanner.Scan() {
+			line := scanner.Text()
+			log.Printf("[STDOUT] %s", line) // Also log locally
+			a.addLog(line, "stdout")
+		}
+	}()
+
+	// Stream stderr
+	go func() {
+		scanner := bufio.NewScanner(stderrPipe)
+		for scanner.Scan() {
+			line := scanner.Text()
+			log.Printf("[STDERR] %s", line) // Also log locally
+			a.addLog(line, "stderr")
+		}
+	}()
 
 	return nil
 }
@@ -453,6 +583,12 @@ func (a *Agent) monitorSetup() error {
 	// Wait for setup to complete
 	err := a.setupCmd.Wait()
 
+	// Give goroutines a moment to finish reading remaining output
+	time.Sleep(500 * time.Millisecond)
+
+	// Push any remaining logs immediately
+	a.pushLogs()
+
 	if err != nil {
 		// Check if context was cancelled
 		if a.ctx.Err() != nil {
@@ -460,22 +596,103 @@ func (a *Agent) monitorSetup() error {
 			return nil
 		}
 
-		// Read log for error details
-		logPath := filepath.Join(a.workDir, "setup.log")
-		logData, _ := os.ReadFile(logPath)
-
-		log.Printf("Setup script failed. Log contents:\n%s", string(logData))
+		log.Printf("Setup script failed with error: %v", err)
+		a.updateStatus("failed", fmt.Sprintf("Setup script failed: %v", err))
 		return fmt.Errorf("setup script exited with error: %w", err)
 	}
 
 	log.Println("Setup script completed successfully")
-	a.updateStatus("completed", "Deployment completed successfully")
+	if err := a.updateStatus("completed", "Deployment completed successfully"); err != nil {
+		log.Printf("Warning: Failed to update completion status: %v", err)
+		// Don't return error here as the script itself succeeded
+	}
 
 	return nil
 }
 
+func (a *Agent) logPushLoop() {
+	ticker := time.NewTicker(3 * time.Second)
+	defer ticker.Stop()
+
+	for {
+		select {
+		case <-a.ctx.Done():
+			// Push any remaining logs before exiting
+			a.pushLogs()
+			return
+		case <-ticker.C:
+			a.pushLogs()
+		}
+	}
+}
+
+func (a *Agent) pushLogs() {
+	a.logMutex.Lock()
+	if len(a.logBuffer) == 0 {
+		a.logMutex.Unlock()
+		return
+	}
+
+	// Copy buffer and clear it
+	logsToPush := make([]LogEntry, len(a.logBuffer))
+	copy(logsToPush, a.logBuffer)
+	a.logBuffer = a.logBuffer[:0]
+	a.logMutex.Unlock()
+
+	log.Printf("Pushing %d log entries to daemon at %s", len(logsToPush), a.logsURL)
+
+	// Send logs to daemon
+	payload := map[string]interface{}{
+		"logs": logsToPush,
+	}
+
+	data, err := json.Marshal(payload)
+	if err != nil {
+		log.Printf("Failed to marshal logs: %v", err)
+		return
+	}
+
+	req, err := http.NewRequestWithContext(a.ctx, "POST", a.logsURL, bytes.NewReader(data))
+	if err != nil {
+		log.Printf("Failed to create log push request: %v", err)
+		return
+	}
+
+	req.Header.Set("Content-Type", "application/json")
+	req.Header.Set("Authorization", fmt.Sprintf("Bearer %s", a.authToken))
+
+	resp, err := a.client.Do(req)
+	if err != nil {
+		log.Printf("Failed to push logs: %v", err)
+		return
+	}
+	defer resp.Body.Close()
+
+	if resp.StatusCode != http.StatusOK {
+		body, _ := io.ReadAll(resp.Body)
+		log.Printf("Log push failed with status %d: %s", resp.StatusCode, string(body))
+	} else {
+		log.Printf("Successfully pushed %d logs", len(logsToPush))
+	}
+}
+
+func (a *Agent) addLog(message, stream string) {
+	a.logMutex.Lock()
+	defer a.logMutex.Unlock()
+
+	a.logBuffer = append(a.logBuffer, LogEntry{
+		Timestamp: time.Now(),
+		NodeID:    a.nodeID,
+		Message:   message,
+		Stream:    stream,
+	})
+}
+
 func (a *Agent) cleanup() {
 	log.Println("Cleaning up agent resources...")
+
+	// Push any remaining logs
+	a.pushLogs()
 
 	a.cancel()
 

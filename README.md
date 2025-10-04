@@ -14,10 +14,15 @@ It was designed and built because I didn't have the time to invest in a full blo
 
 ## Architecture
 
-TaskFly consists of two main components:
+TaskFly consists of three main components:
 
 ### 1. TaskFly CLI (`taskfly`)
-The client-side command-line interface for managing deployments. It bundles your application files and configuration, then sends them to the daemon for orchestration.
+The client-side command-line interface for managing deployments. Features include:
+- Bundle and deploy applications
+- Interactive REPL shell for managing deployments
+- Real-time dashboard with live metrics (refreshes every second)
+- Docker-compose style log streaming
+- Deployment status monitoring
 
 ### 2. TaskFly Daemon (`taskflyd`)
 The server-side daemon that handles:
@@ -25,13 +30,28 @@ The server-side daemon that handles:
 - Node registration and authentication
 - Configuration distribution
 - Deployment lifecycle management
+- Distributed log collection and storage
+- System metrics aggregation
 - Health monitoring and cleanup
+
+### 3. TaskFly Agent (`taskfly-agent`)
+Lightweight agent deployed to each node that:
+- Registers with the daemon
+- Downloads application bundles
+- Executes setup scripts
+- Streams logs back to daemon (every 2 seconds)
+- Collects and reports system metrics (CPU, memory, load)
+- Sends regular heartbeats
 
 ## Features
 
 - 🚀 **Simple Deployment** - Bundle and deploy with a single command
 - 📦 **Asset Distribution** - Automatically distribute application files to all nodes
-- 📊 **Real-time Status** - Monitor deployment progress and node health
+- 📊 **Real-time Dashboard** - Live monitoring with system metrics, deployment status, and progress tracking (auto-refreshes every second)
+- 📝 **Distributed Logging** - Docker-compose style log streaming from all nodes with follow mode and filtering
+- 💻 **Interactive Shell** - REPL interface for managing deployments with command history
+- 📈 **System Metrics** - CPU cores, memory usage, and load average monitoring from all nodes
+- 🎨 **Beautiful Tables** - Clean, formatted output with color-coded status indicators
 - 🔄 **Flexible Configuration** - Support for global metadata and distributed lists
 - 🧹 **Automatic Cleanup** - Built-in cleanup for completed deployments
 - ☁️ **Multi-Cloud Ready** - Extensible architecture for multiple cloud providers
@@ -121,9 +141,45 @@ taskfly list
 # Get deployment status
 taskfly status --id <deployment-id>
 
+# View logs from deployment (Docker-compose style)
+taskfly logs --id <deployment-id>
+
+# Follow logs in real-time
+taskfly logs --id <deployment-id> --follow
+
+# Filter logs by specific node
+taskfly logs --id <deployment-id> --node <node-id>
+
 # Terminate a deployment
 taskfly down --id <deployment-id>
 ```
+
+### Interactive Shell & Dashboard
+
+```bash
+# Start interactive shell
+taskfly shell
+
+# Within the shell, you can use these commands:
+taskfly> dashboard     # Show live dashboard (refreshes every second, Ctrl+C to exit)
+taskfly> list          # List all deployments
+taskfly> status <id>   # Show deployment status
+taskfly> logs <id>     # View logs
+taskfly> down <id>     # Terminate deployment
+taskfly> help          # Show all commands
+taskfly> exit          # Exit shell
+
+# Or run dashboard directly
+taskfly dashboard
+```
+
+**Dashboard Features:**
+- **System Resources**: Total CPU cores, load average, memory usage, active nodes
+- **Deployment Overview**: Deployment counts by status (running, provisioning, completed, failed)
+- **Recent Deployments**: Last 5 deployments with progress bars
+- **Node Metrics**: Per-node CPU, load, memory, and last update time
+- **Color-coded alerts**: Green (healthy), Yellow (70-90% utilization), Red (>90% utilization)
+- **Auto-refresh**: Updates every second with live data
 
 ## Configuration
 
@@ -131,6 +187,7 @@ taskfly down --id <deployment-id>
 
 #### TaskFly CLI
 - `TASKFLY_DAEMON_IP` - IP address of the TaskFly daemon (default: `localhost`)
+- `TASKFLY_DAEMON_PORT` - Port of the TaskFly daemon (default: `8080`)
 - `TASKFLY_VERBOSE` - Enable verbose logging
 
 #### TaskFly Daemon
@@ -140,6 +197,19 @@ taskfly down --id <deployment-id>
 - `TASKFLY_DAEMON_PORT` - Public port for node callbacks (default: `8080`)
 - `TASKFLY_VERBOSE` - Enable verbose logging
 - `TASKFLY_DEPLOYMENT_DIR` - Directory for deployment files (default: `deployments`)
+
+### CLI Flags
+
+```bash
+# Global flags (available for all commands)
+--daemon-ip, -d     IP address of daemon (default: "localhost")
+--daemon-port, -p   Port of daemon (default: "8080")
+--verbose, -v       Enable verbose logging
+
+# Example usage
+taskfly --daemon-ip 10.0.0.1 --daemon-port 8080 list
+taskfly -d 10.0.0.1 -p 8080 dashboard
+```
 
 ### Node Configuration Patterns
 

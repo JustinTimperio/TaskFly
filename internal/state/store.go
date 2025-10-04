@@ -35,6 +35,27 @@ const (
 	NodeStatusTerminated   NodeStatus = "terminated"
 )
 
+// LogEntry represents a single log line from a node
+type LogEntry struct {
+	Timestamp    time.Time `json:"timestamp"`
+	NodeID       string    `json:"node_id"`
+	DeploymentID string    `json:"deployment_id"`
+	Message      string    `json:"message"`
+	Stream       string    `json:"stream"` // "stdout" or "stderr"
+}
+
+// SystemMetrics represents system resource metrics from a node
+type SystemMetrics struct {
+	CPUCores    int     `json:"cpu_cores"`
+	CPUUsage    float64 `json:"cpu_usage"`
+	MemoryTotal uint64  `json:"memory_total"`
+	MemoryUsed  uint64  `json:"memory_used"`
+	LoadAvg1    float64  `json:"load_avg_1"`
+	LoadAvg5    float64 `json:"load_avg_5"`
+	LoadAvg15   float64 `json:"load_avg_15"`
+	Timestamp   time.Time `json:"timestamp"`
+}
+
 // Node represents a single node in a deployment
 type Node struct {
 	NodeID         string                 `json:"node_id"`
@@ -49,6 +70,7 @@ type Node struct {
 	ShouldShutdown bool                   `json:"should_shutdown"`
 	LastUpdate     time.Time              `json:"last_update"`
 	ErrorMessage   string                 `json:"error_message,omitempty"`
+	Metrics        *SystemMetrics         `json:"metrics,omitempty"`
 }
 
 // Deployment represents a complete deployment with all its nodes
@@ -85,6 +107,14 @@ type StateStore interface {
 	MarkNodeForShutdown(deploymentID, nodeID string) error
 	DeleteDeployment(deploymentID string) error
 	GetStats() map[string]interface{}
+
+	// Log management
+	AppendLogs(deploymentID string, logs []LogEntry) error
+	GetLogs(deploymentID string, nodeID string, since time.Time, limit int) ([]LogEntry, error)
+	ClearLogs(deploymentID string) error
+
+	// Metrics management
+	UpdateNodeMetrics(deploymentID, nodeID string, metrics *SystemMetrics) error
 }
 
 // Store manages all deployment and node state in memory
@@ -93,6 +123,8 @@ type Store struct {
 	deployments map[string]*Deployment
 	nodes       map[string]*Node   // key is node_id
 	nodesByDep  map[string][]*Node // key is deployment_id
+	logs        map[string][]LogEntry // key is deployment_id, circular buffer
+	maxLogsPerDeployment int
 }
 
 // NewStore creates a new in-memory state store
@@ -101,6 +133,8 @@ func NewStore() *Store {
 		deployments: make(map[string]*Deployment),
 		nodes:       make(map[string]*Node),
 		nodesByDep:  make(map[string][]*Node),
+		logs:        make(map[string][]LogEntry),
+		maxLogsPerDeployment: 10000, // Keep last 10K log entries per deployment
 	}
 }
 
@@ -455,9 +489,107 @@ func (s *Store) GetStats() map[string]interface{} {
 		statusCounts[dep.Status]++
 	}
 
+	totalLogs := 0
+	for _, logs := range s.logs {
+		totalLogs += len(logs)
+	}
+
 	return map[string]interface{}{
 		"total_deployments": len(s.deployments),
 		"total_nodes":       len(s.nodes),
+		"total_logs":        totalLogs,
 		"deployment_status": statusCounts,
 	}
+}
+
+// AppendLogs adds log entries for a deployment
+func (s *Store) AppendLogs(deploymentID string, logs []LogEntry) error {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+
+	// Verify deployment exists
+	if _, exists := s.deployments[deploymentID]; !exists {
+		return fmt.Errorf("deployment %s not found", deploymentID)
+	}
+
+	// Get existing logs
+	existingLogs := s.logs[deploymentID]
+
+	// Append new logs
+	existingLogs = append(existingLogs, logs...)
+
+	// Trim to max size (keep most recent)
+	if len(existingLogs) > s.maxLogsPerDeployment {
+		existingLogs = existingLogs[len(existingLogs)-s.maxLogsPerDeployment:]
+	}
+
+	s.logs[deploymentID] = existingLogs
+	return nil
+}
+
+// GetLogs retrieves logs for a deployment, optionally filtered by node and time
+func (s *Store) GetLogs(deploymentID string, nodeID string, since time.Time, limit int) ([]LogEntry, error) {
+	s.mu.RLock()
+	defer s.mu.RUnlock()
+
+	// Verify deployment exists
+	if _, exists := s.deployments[deploymentID]; !exists {
+		return nil, fmt.Errorf("deployment %s not found", deploymentID)
+	}
+
+	allLogs := s.logs[deploymentID]
+	if allLogs == nil {
+		return []LogEntry{}, nil
+	}
+
+	// Filter logs
+	var filtered []LogEntry
+	for _, log := range allLogs {
+		// Filter by node if specified
+		if nodeID != "" && log.NodeID != nodeID {
+			continue
+		}
+		// Filter by time if specified
+		if !since.IsZero() && log.Timestamp.Before(since) {
+			continue
+		}
+		filtered = append(filtered, log)
+	}
+
+	// Apply limit
+	if limit > 0 && len(filtered) > limit {
+		filtered = filtered[len(filtered)-limit:]
+	}
+
+	return filtered, nil
+}
+
+// ClearLogs removes all logs for a deployment
+func (s *Store) ClearLogs(deploymentID string) error {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+
+	delete(s.logs, deploymentID)
+	return nil
+}
+
+// UpdateNodeMetrics updates the metrics for a node
+func (s *Store) UpdateNodeMetrics(deploymentID, nodeID string, metrics *SystemMetrics) error {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+
+	node, exists := s.nodes[nodeID]
+	if !exists {
+		return fmt.Errorf("node %s not found", nodeID)
+	}
+
+	if node.DeploymentID != deploymentID {
+		return fmt.Errorf("node %s does not belong to deployment %s", nodeID, deploymentID)
+	}
+
+	metrics.Timestamp = time.Now()
+	node.Metrics = metrics
+	node.LastUpdate = time.Now()
+
+	return nil
 }

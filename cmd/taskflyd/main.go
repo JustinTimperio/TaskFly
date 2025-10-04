@@ -1,12 +1,16 @@
 package main
 
+//go:generate go run ../build-agents/main.go
+
 import (
 	"context"
+	_ "embed"
 	"fmt"
 	"net/http"
 	"os"
 	"os/signal"
 	"path/filepath"
+	"sort"
 	"time"
 
 	"github.com/JustinTimperio/TaskFly/internal/orchestrator"
@@ -16,6 +20,19 @@ import (
 	"github.com/sirupsen/logrus"
 	"github.com/urfave/cli/v2"
 )
+
+// Embed agent binaries (paths must be relative to this package directory)
+//go:embed agents/taskfly-agent-darwin-amd64
+var agentDarwinAmd64 []byte
+
+//go:embed agents/taskfly-agent-darwin-arm64
+var agentDarwinArm64 []byte
+
+//go:embed agents/taskfly-agent-linux-amd64
+var agentLinuxAmd64 []byte
+
+//go:embed agents/taskfly-agent-linux-arm64
+var agentLinuxArm64 []byte
 
 // Global instances
 var (
@@ -79,6 +96,31 @@ func main() {
 		logrus.Fatal(err)
 	}
 }
+// extractEmbeddedAgents writes the embedded agent binaries to the build/agent directory
+func extractEmbeddedAgents() error {
+	agentDir := "build/agent"
+	if err := os.MkdirAll(agentDir, 0755); err != nil {
+		return fmt.Errorf("failed to create agent directory: %w", err)
+	}
+
+	agents := map[string][]byte{
+		"taskfly-agent-darwin-amd64": agentDarwinAmd64,
+		"taskfly-agent-darwin-arm64": agentDarwinArm64,
+		"taskfly-agent-linux-amd64":  agentLinuxAmd64,
+		"taskfly-agent-linux-arm64":  agentLinuxArm64,
+	}
+
+	for name, data := range agents {
+		path := filepath.Join(agentDir, name)
+		if err := os.WriteFile(path, data, 0755); err != nil {
+			return fmt.Errorf("failed to write agent %s: %w", name, err)
+		}
+		logger.Debugf("Extracted embedded agent: %s", path)
+	}
+
+	return nil
+}
+
 func runDaemon(c *cli.Context) error {
 	// Setup and initialization
 	startTime = time.Now()
@@ -91,6 +133,12 @@ func runDaemon(c *cli.Context) error {
 	})
 	logger.SetLevel(logrus.InfoLevel)
 	logger.Infof("Starting TaskFlyd daemon...")
+
+	// Extract embedded agent binaries
+	logger.Info("Extracting embedded agent binaries...")
+	if err := extractEmbeddedAgents(); err != nil {
+		logger.Fatalf("Failed to extract agent binaries: %v", err)
+	}
 
 	// Create deployment working directory
 	var err error
@@ -145,16 +193,19 @@ func runDaemon(c *cli.Context) error {
 	api.GET("/deployments", listDeployments)
 	api.GET("/deployments/:id", getDeployment)
 	api.DELETE("/deployments/:id", deleteDeployment)
+	api.GET("/deployments/:id/logs", getDeploymentLogs)
 
 	// Node endpoints
 	api.POST("/nodes/register", registerNode)
 	api.GET("/nodes/assets", getNodeAssets)
 	api.POST("/nodes/heartbeat", nodeHeartbeat)
 	api.POST("/nodes/status", updateNodeStatus)
+	api.POST("/nodes/logs", pushNodeLogs)
 
 	// Health and stats endpoints
 	api.GET("/health", healthCheck)
 	api.GET("/stats", getStats)
+	api.GET("/metrics", getMetrics)
 
 	// Cleanup endpoints
 	api.POST("/deployments/:id/cleanup", cleanupDeployment)
@@ -417,7 +468,7 @@ func registerNode(c echo.Context) error {
 	}
 
 	logger.Infof("Successfully registered node %s", foundNode.NodeID)
-	return c.JSON(http.StatusOK, map[string]string{
+	return c.JSON(http.StatusOK, map[string]interface{}{
 		"auth_token":    authToken,
 		"deployment_id": foundDep.ID,
 		"node_id":       foundNode.NodeID,
@@ -425,6 +476,8 @@ func registerNode(c echo.Context) error {
 		"assets_url":    fmt.Sprintf("%s/api/v1/nodes/assets", daemonIP),
 		"heartbeat_url": fmt.Sprintf("%s/api/v1/nodes/heartbeat", daemonIP),
 		"status_url":    fmt.Sprintf("%s/api/v1/nodes/status", daemonIP),
+		"logs_url":      fmt.Sprintf("%s/api/v1/nodes/logs", daemonIP),
+		"config":        foundNode.Config, // Send node configuration
 	})
 }
 
@@ -511,6 +564,21 @@ func nodeHeartbeat(c echo.Context) error {
 		return c.JSON(http.StatusUnauthorized, map[string]string{"error": "Invalid auth token"})
 	}
 
+	// Parse heartbeat request body (may include metrics)
+	var req struct {
+		Metrics *state.SystemMetrics `json:"metrics"`
+	}
+	if err := c.Bind(&req); err == nil && req.Metrics != nil {
+		// Store metrics
+		if err := store.UpdateNodeMetrics(dep.ID, node.NodeID, req.Metrics); err != nil {
+			logger.Errorf("Failed to update metrics for node %s: %v", node.NodeID, err)
+		} else {
+			logger.Debugf("Updated metrics for node %s: CPU=%d cores, Load=%.2f, Mem=%dMB/%dMB",
+				node.NodeID, req.Metrics.CPUCores, req.Metrics.LoadAvg1,
+				req.Metrics.MemoryUsed/1024/1024, req.Metrics.MemoryTotal/1024/1024)
+		}
+	}
+
 	// Update last seen time
 	err = store.UpdateNodeLastSeen(dep.ID, node.NodeID)
 	if err != nil {
@@ -518,8 +586,12 @@ func nodeHeartbeat(c echo.Context) error {
 		// Non-critical, so we don't return an error to the agent
 	}
 
-	// Update node status to running if it's not already
-	if node.Status != state.NodeStatusRunning {
+	// Update node status to running_script if it's not already in a terminal state
+	// Don't overwrite completed/failed/terminated states
+	if node.Status != state.NodeStatusRunning &&
+		node.Status != state.NodeStatusCompleted &&
+		node.Status != state.NodeStatusFailed &&
+		node.Status != state.NodeStatusTerminated {
 		err = store.UpdateNodeStatus(dep.ID, node.NodeID, state.NodeStatusRunning)
 		if err != nil {
 			logger.Errorf("Failed to update status to running for node %s: %v", node.NodeID, err)
@@ -598,6 +670,88 @@ func getStats(c echo.Context) error {
 	return c.JSON(http.StatusOK, stats)
 }
 
+func getMetrics(c echo.Context) error {
+	deployments := store.GetAllDeployments()
+
+	var totalCores int
+	var totalMemory, totalMemoryUsed uint64
+	var avgLoad float64
+	nodeCount := 0
+
+	type NodeMetrics struct {
+		NodeID     string               `json:"node_id"`
+		IPAddress  string               `json:"ip_address"`
+		Status     state.NodeStatus     `json:"status"`
+		Metrics    *state.SystemMetrics `json:"metrics"`
+		LastUpdate string               `json:"last_update"`
+	}
+
+	// Use a map to deduplicate nodes by IP address (keep track of time.Time for comparison)
+	type nodeEntry struct {
+		metrics    NodeMetrics
+		lastUpdate time.Time
+	}
+	nodesByIP := make(map[string]nodeEntry)
+
+	for _, dep := range deployments {
+		nodes, _ := store.GetNodesByDeployment(dep.ID)
+		for _, node := range nodes {
+			// Skip nodes without IP addresses
+			if node.IPAddress == "" {
+				continue
+			}
+
+			// Check if we already have this IP, keep the one with the most recent update
+			existing, exists := nodesByIP[node.IPAddress]
+			if !exists || node.LastUpdate.After(existing.lastUpdate) {
+				nodesByIP[node.IPAddress] = nodeEntry{
+					metrics: NodeMetrics{
+						NodeID:     node.NodeID,
+						IPAddress:  node.IPAddress,
+						Status:     node.Status,
+						Metrics:    node.Metrics,
+						LastUpdate: node.LastUpdate.Format(time.RFC3339),
+					},
+					lastUpdate: node.LastUpdate,
+				}
+			}
+		}
+	}
+
+	// Convert map to slice and calculate totals
+	allNodes := []NodeMetrics{}
+	for _, entry := range nodesByIP {
+		if entry.metrics.Metrics != nil {
+			totalCores += entry.metrics.Metrics.CPUCores
+			totalMemory += entry.metrics.Metrics.MemoryTotal
+			totalMemoryUsed += entry.metrics.Metrics.MemoryUsed
+			avgLoad += entry.metrics.Metrics.LoadAvg1
+			nodeCount++
+		}
+		allNodes = append(allNodes, entry.metrics)
+	}
+
+	// Sort nodes by IP address for deterministic ordering
+	sort.Slice(allNodes, func(i, j int) bool {
+		return allNodes[i].IPAddress < allNodes[j].IPAddress
+	})
+
+	if nodeCount > 0 {
+		avgLoad /= float64(nodeCount)
+	}
+
+	return c.JSON(http.StatusOK, map[string]interface{}{
+		"summary": map[string]interface{}{
+			"total_cores":          totalCores,
+			"total_memory_gb":      float64(totalMemory) / 1024 / 1024 / 1024,
+			"total_memory_used_gb": float64(totalMemoryUsed) / 1024 / 1024 / 1024,
+			"avg_load":             avgLoad,
+			"nodes_with_metrics":   nodeCount,
+		},
+		"nodes": allNodes,
+	})
+}
+
 func cleanupDeployment(c echo.Context) error {
 	id := c.Param("id")
 	logger.Infof("Cleaning up deployment: %s", id)
@@ -652,6 +806,91 @@ func cleanupAllCompleted(c echo.Context) error {
 
 func healthCheck(c echo.Context) error {
 	return c.JSON(http.StatusOK, map[string]string{"status": "ok"})
+}
+
+func pushNodeLogs(c echo.Context) error {
+	authHeader := c.Request().Header.Get("Authorization")
+
+	// Validate auth token
+	if authHeader == "" {
+		logger.Warn("Log push received with no auth token")
+		return c.JSON(http.StatusUnauthorized, map[string]string{"error": "Missing auth token"})
+	}
+
+	// Extract token from "Bearer <token>" format
+	var authToken string
+	if len(authHeader) > 7 && authHeader[:7] == "Bearer " {
+		authToken = authHeader[7:]
+	} else {
+		return c.JSON(http.StatusUnauthorized, map[string]string{"error": "Invalid authorization header format"})
+	}
+
+	// Find node by auth token
+	node, dep, err := store.FindNodeByAuthToken(authToken)
+	if err != nil {
+		logger.Warnf("Log push with invalid auth token: %s", authToken)
+		return c.JSON(http.StatusUnauthorized, map[string]string{"error": "Invalid auth token"})
+	}
+
+	// Parse log entries
+	var req struct {
+		Logs []state.LogEntry `json:"logs"`
+	}
+	if err := c.Bind(&req); err != nil {
+		logger.Errorf("Failed to parse log push request: %v", err)
+		return c.JSON(http.StatusBadRequest, map[string]string{"error": "Invalid request"})
+	}
+
+	// Set deployment ID and node ID for all logs
+	for i := range req.Logs {
+		req.Logs[i].DeploymentID = dep.ID
+		req.Logs[i].NodeID = node.NodeID
+	}
+
+	// Store logs
+	if err := store.AppendLogs(dep.ID, req.Logs); err != nil {
+		logger.Errorf("Failed to store logs for node %s: %v", node.NodeID, err)
+		return c.JSON(http.StatusInternalServerError, map[string]string{"error": "Failed to store logs"})
+	}
+
+	logger.Debugf("Received %d log entries from node %s", len(req.Logs), node.NodeID)
+	return c.JSON(http.StatusOK, map[string]string{"status": "ok"})
+}
+
+func getDeploymentLogs(c echo.Context) error {
+	id := c.Param("id")
+	nodeID := c.QueryParam("node")
+	sinceStr := c.QueryParam("since")
+	limitStr := c.QueryParam("limit")
+
+	// Parse since parameter
+	var since time.Time
+	if sinceStr != "" {
+		parsed, err := time.Parse(time.RFC3339, sinceStr)
+		if err != nil {
+			return c.JSON(http.StatusBadRequest, map[string]string{"error": "Invalid 'since' parameter, must be RFC3339 format"})
+		}
+		since = parsed
+	}
+
+	// Parse limit parameter
+	limit := 1000 // default
+	if limitStr != "" {
+		fmt.Sscanf(limitStr, "%d", &limit)
+	}
+
+	// Get logs
+	logs, err := store.GetLogs(id, nodeID, since, limit)
+	if err != nil {
+		logger.Errorf("Failed to get logs for deployment %s: %v", id, err)
+		return c.JSON(http.StatusNotFound, map[string]string{"error": "Deployment not found"})
+	}
+
+	return c.JSON(http.StatusOK, map[string]interface{}{
+		"deployment_id": id,
+		"logs":          logs,
+		"count":         len(logs),
+	})
 }
 
 // getDefaultDeploymentDir returns ~/.taskfly/deployments

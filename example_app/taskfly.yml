@@ -2,30 +2,33 @@ cloud_provider: "local"
 
 instance_config:
   local:
-    ssh_user: "user"  # Update this to your actual SSH username
-    ssh_key_path: "~/.ssh/id_ed25519"  # Update this to your actual SSH key path
+    ssh_user: "user" # Update this to your actual SSH username
+    ssh_key_path: "~/.ssh/id_ed25519" # Update this to your actual SSH key path
     hosts:
       - "192.168.50.14"
-      - "192.168.50.194"  
+      - "192.168.50.194"
       - "192.168.50.236"
 
 # Enhanced multi-node configuration with dynamic metadata
 nodes:
   count: 3
-  
+
   # Global metadata available to all nodes
   global_metadata:
     project_name: "batch_processor"
     s3_bucket: "my-data-bucket"
     batch_size: 1000
-    
+
   # List-based metadata (automatically distributed across nodes)
   # Note: Only simple types (string, int, float, bool) are supported
   distributed_lists:
     s3_paths:
       - "s3://my-data-bucket/chunk-001.csv"
-      - "s3://my-data-bucket/chunk-002.csv" 
+      - "s3://my-data-bucket/chunk-002.csv"
       - "s3://my-data-bucket/chunk-003.csv"
+      - "s3://my-data-bucket/chunk-004.csv"
+      - "s3://my-data-bucket/chunk-005.csv"
+      - "s3://my-data-bucket/chunk-006.csv"
     worker_concurrency:
       - 4
       - 8
@@ -34,27 +37,27 @@ nodes:
       - 2
       - 4
       - 3
-  
+
   # Template for per-node configuration with enhanced metadata
   config_template:
     # Built-in variables: node_id, node_index, total_nodes, deployment_id
     worker_id: "{node_id}"
     worker_index: "{node_index}"
     total_workers: "{total_nodes}"
-    
+
     # Access global metadata
     project: "{project_name}"
     bucket: "{s3_bucket}"
-    
+
     # Distributed list access (automatically assigned by index)
     data_source: "{s3_paths}"
     concurrency: "{worker_concurrency}"
     memory_gb: "{worker_memory_gb}"
-    
+
     # Computed values and simple expressions
     output_path: "s3://{s3_bucket}/results/worker-{node_index}"
-    batch_start: "{node_index}000"  # Simple calculation: node_index * 1000
-    batch_end: "{node_index}999"    # Simple calculation: (node_index * 1000) + 999
+    batch_start: "{node_index}000" # Simple calculation: node_index * 1000
+    batch_end: "{node_index}999" # Simple calculation: (node_index * 1000) + 999
 
 application_files:
   - "setup.sh"

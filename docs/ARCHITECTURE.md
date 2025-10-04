@@ -2,7 +2,7 @@
 
 ## Overview
 
-TaskFly is a distributed task orchestration system consisting of a daemon (server) and CLI (client) that work together to deploy and manage applications across cloud infrastructure. The system provisions cloud instances, distributes application bundles, and manages the lifecycle of distributed workloads.
+TaskFly is a distributed task orchestration system consisting of a daemon (server), CLI (client), and agent that work together to deploy and manage applications across cloud infrastructure. The system provisions cloud instances, distributes application bundles, manages the lifecycle of distributed workloads, and provides real-time monitoring through distributed logging and metrics collection.
 
 ## System Components
 
@@ -10,6 +10,8 @@ TaskFly is a distributed task orchestration system consisting of a daemon (serve
 graph TB
     subgraph "Client Side"
         CLI[TaskFly CLI]
+        Shell[Interactive Shell]
+        Dashboard[Real-time Dashboard]
         Config[taskfly.yml]
         AppFiles[Application Files]
     end
@@ -18,6 +20,8 @@ graph TB
         API[REST API Server]
         Orchestrator[Orchestrator Engine]
         StateStore[In-Memory State Store]
+        LogStore[Log Buffer - 10K entries]
+        MetricsStore[System Metrics Store]
         CloudProviders[Cloud Providers]
     end
 
@@ -25,9 +29,12 @@ graph TB
         AWS[AWS Provider]
         Local[Local Provider]
         Instances[Cloud Instances/Nodes]
+        Agent[TaskFly Agent]
     end
 
     CLI -->|Bundle & Deploy| API
+    Shell -->|Interactive Commands| CLI
+    Dashboard -->|Fetch Metrics/Logs| API
     Config -->|Configuration| CLI
     AppFiles -->|Bundle| CLI
     API -->|Process Deployment| Orchestrator
@@ -37,7 +44,10 @@ graph TB
     CloudProviders --> Local
     AWS -->|Launch| Instances
     Local -->|Launch| Instances
-    Instances -->|Register & Heartbeat| API
+    Instances -->|Run| Agent
+    Agent -->|Register & Heartbeat| API
+    Agent -->|Push Logs Every 2s| LogStore
+    Agent -->|Send Metrics| MetricsStore
     API -->|Status Updates| StateStore
 ```
 
@@ -167,12 +177,15 @@ POST   /api/v1/cleanup/all          Cleanup all completed deployments
 ```
 POST   /api/v1/nodes/register       Register node with provision token
 GET    /api/v1/nodes/assets         Download application bundle
-POST   /api/v1/nodes/heartbeat      Send heartbeat
+POST   /api/v1/nodes/heartbeat      Send heartbeat with system metrics
 POST   /api/v1/nodes/status         Update node status
+POST   /api/v1/nodes/logs           Push logs from node
 ```
 
-### Health & Stats
+### Monitoring & Observability Endpoints
 ```
+GET    /api/v1/deployments/:id/logs Fetch logs for deployment (with filters)
+GET    /api/v1/metrics              Get system metrics summary and per-node data
 GET    /api/v1/health               Health check
 GET    /api/v1/stats                Get daemon statistics
 ```
@@ -414,32 +427,6 @@ type Provider interface {
 
 ---
 
-## Future Enhancements
-
-### Planned Features
-- [ ] Persistent state storage (database)
-- [ ] Node heartbeat timeout detection
-- [ ] Graceful node termination
-- [ ] Resource pool for instance reuse
-- [ ] GCP and Azure providers
-- [ ] Deployment templates
-- [ ] Node auto-scaling
-- [ ] Web UI dashboard
-- [ ] Metrics and monitoring
-- [ ] Rolling deployments
-- [ ] Deployment rollback
-
-### Architectural Improvements
-- [ ] Message queue for node events
-- [ ] Separate orchestrator service
-- [ ] Multi-tenancy support
-- [ ] API rate limiting
-- [ ] Webhook notifications
-- [ ] Deployment snapshots
-- [ ] Node health checks beyond heartbeat
-
----
-
 ## Dependencies
 
 ### Core Libraries
@@ -458,9 +445,165 @@ type Provider interface {
 
 ---
 
+## Distributed Logging Architecture
+
+```mermaid
+graph LR
+    subgraph "Agent on Node"
+        Script[Setup Script Execution]
+        Stdout[Stdout Capture]
+        Stderr[Stderr Capture]
+        LogBuffer[Local Log Buffer]
+    end
+
+    subgraph "Daemon Log Store"
+        LogAPI[POST /nodes/logs]
+        CircularBuffer[Circular Buffer<br/>10K entries per deployment]
+        LogFetch[GET /deployments/:id/logs]
+    end
+
+    subgraph "CLI"
+        LogsCommand[logs command]
+        LogDisplay[Docker-compose style output]
+    end
+
+    Script --> Stdout
+    Script --> Stderr
+    Stdout --> LogBuffer
+    Stderr --> LogBuffer
+    LogBuffer -->|Push every 2s| LogAPI
+    LogAPI --> CircularBuffer
+    CircularBuffer --> LogFetch
+    LogFetch --> LogsCommand
+    LogsCommand --> LogDisplay
+```
+
+### Logging Features
+- **Real-time streaming**: Logs pushed from agents every 2 seconds
+- **Docker-compose style output**: Color-coded node names with log messages
+- **Stream separation**: Stdout and stderr tracked separately
+- **Circular buffer**: 10,000 entries per deployment (automatic old log pruning)
+- **Follow mode**: Real-time log tailing with `--follow` flag
+- **Node filtering**: View logs from specific nodes with `--node` flag
+- **Timestamp tracking**: Incremental fetch using `since` parameter
+
+---
+
+## System Metrics Collection
+
+```mermaid
+graph LR
+    subgraph "Agent Metrics Collection"
+        ProcFS[/proc filesystem]
+        CPUCount[CPU Core Count]
+        LoadAvg[Load Averages]
+        MemInfo[Memory Usage]
+        Heartbeat[Heartbeat Payload]
+    end
+
+    subgraph "Daemon Metrics Store"
+        MetricsAPI[POST /nodes/heartbeat]
+        NodeMetrics[Per-Node Metrics]
+        Summary[Aggregated Summary]
+        MetricsEndpoint[GET /metrics]
+    end
+
+    subgraph "CLI Dashboard"
+        DashCmd[dashboard command]
+        SystemPanel[System Resources]
+        DeployPanel[Deployment Overview]
+        NodeTable[Node Metrics Table]
+    end
+
+    ProcFS --> CPUCount
+    ProcFS --> LoadAvg
+    ProcFS --> MemInfo
+    CPUCount --> Heartbeat
+    LoadAvg --> Heartbeat
+    MemInfo --> Heartbeat
+    Heartbeat --> MetricsAPI
+    MetricsAPI --> NodeMetrics
+    NodeMetrics --> Summary
+    Summary --> MetricsEndpoint
+    MetricsEndpoint --> DashCmd
+    DashCmd --> SystemPanel
+    DashCmd --> DeployPanel
+    DashCmd --> NodeTable
+```
+
+### Collected Metrics
+- **CPU Cores**: Total CPU cores available on node
+- **Load Averages**: 1, 5, and 15 minute load averages
+- **Memory**: Total and used memory (in GB)
+- **Timestamp**: Last metrics update time
+
+### Metrics Aggregation
+- **Total Cores**: Sum of all node CPU cores
+- **Average Load**: Mean load across all nodes
+- **Total Memory**: Sum of memory across all nodes
+- **Active Nodes**: Count of nodes with recent metrics
+
+---
+
+## CLI Features
+
+### Interactive Shell
+TaskFly provides an interactive REPL shell for managing deployments:
+
+```bash
+taskfly shell
+```
+
+**Available Commands:**
+- `dashboard, dash` - Show real-time dashboard (auto-refreshes every second)
+- `list, ls` - List all deployments
+- `status <id>` - Show detailed deployment status
+- `logs <id> [--node <node-id>] [--follow]` - View and follow logs
+- `up, deploy` - Deploy from taskfly.yml
+- `down <id>` - Terminate deployment
+- `clear` - Clear screen
+- `help` - Show help
+- `exit, quit` - Exit shell
+
+### Real-time Dashboard
+The dashboard provides live visibility into your TaskFly cluster:
+
+```bash
+taskfly dashboard  # Standalone mode (refreshes every second)
+# Or within shell:
+taskfly> dashboard
+```
+
+**Dashboard Sections:**
+1. **System Resources**: CPU cores, load average, memory usage, active nodes
+2. **Deployment Overview**: Total, running, provisioning, completed, and failed counts
+3. **Recent Deployments**: Last 5 deployments with progress bars
+4. **Node Metrics**: Per-node CPU, load, memory, and last update time
+
+**Color Coding:**
+- Green: Healthy (< 70% utilization)
+- Yellow: Warning (70-90% utilization)
+- Red: Critical (> 90% utilization)
+
+### Log Streaming
+View logs from your deployments in real-time:
+
+```bash
+# View all logs
+taskfly logs --id <deployment-id>
+
+# Follow logs (like tail -f)
+taskfly logs --id <deployment-id> --follow
+
+# Filter by specific node
+taskfly logs --id <deployment-id> --node <node-id>
+```
+
+---
+
 ## Monitoring & Observability
 
-### Current Logging
+### Daemon Logging
 - Structured logs via Logrus
 - Log levels: Debug, Info, Warn, Error
 - Key events logged:
@@ -468,8 +611,16 @@ type Provider interface {
   - Node registration
   - Provisioning status
   - Cleanup operations
+  - Log ingestion
+  - Metrics collection
 
-### Available Metrics (via /stats endpoint)
+### Agent Logging
+- Captures stdout/stderr from setup scripts
+- Buffers logs locally before pushing
+- Pushes logs every 2 seconds
+- Includes stream type (stdout/stderr) and timestamp
+
+### Available Statistics (via /stats endpoint)
 ```json
 {
   "total_deployments": 5,
@@ -482,12 +633,41 @@ type Provider interface {
 }
 ```
 
+### Available Metrics (via /metrics endpoint)
+```json
+{
+  "summary": {
+    "total_cores": 16,
+    "total_memory_gb": 64.0,
+    "total_memory_used_gb": 32.5,
+    "avg_load": 4.2,
+    "nodes_with_metrics": 4
+  },
+  "nodes": [
+    {
+      "node_id": "node-001",
+      "status": "running",
+      "last_update": "2024-01-15T10:30:00Z",
+      "metrics": {
+        "cpu_cores": 4,
+        "load_avg_1": 1.2,
+        "load_avg_5": 1.5,
+        "load_avg_15": 1.3,
+        "memory_total": 17179869184,
+        "memory_used": 8589934592
+      }
+    }
+  ]
+}
+```
+
 ### Future Observability
-- Prometheus metrics
+- Prometheus metrics export
 - Distributed tracing
 - Performance profiling
 - Audit logs
 - Error tracking integration
+- Log persistence and search
 
 ---
 

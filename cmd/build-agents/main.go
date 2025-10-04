@@ -24,15 +24,10 @@ var targets = []BuildTarget{
 func main() {
 	log.Println("🚀 Building TaskFly agent binaries...")
 
-	// Get project root from working directory (should be run from project root via go generate)
-	projectRoot, err := os.Getwd()
+	// Get project root - walk up from current directory until we find go.mod
+	projectRoot, err := findProjectRoot()
 	if err != nil {
-		log.Fatalf("Failed to get working directory: %v", err)
-	}
-
-	// Verify we're in the project root by checking for go.mod
-	if _, err := os.Stat(filepath.Join(projectRoot, "go.mod")); err != nil {
-		log.Fatalf("go.mod not found. This tool must be run from the project root via 'go generate ./internal/cloud'")
+		log.Fatalf("Failed to find project root: %v", err)
 	}
 
 	log.Printf("Project root: %s", projectRoot)
@@ -65,23 +60,51 @@ func main() {
 		os.Exit(1)
 	}
 
+	// Copy agents to cmd/taskflyd/agents for embedding
+	log.Println("Copying agents to cmd/taskflyd/agents for embedding...")
+	if err := copyAgentsForEmbedding(projectRoot); err != nil {
+		log.Fatalf("Failed to copy agents for embedding: %v", err)
+	}
+
 	log.Println("✅ All agent binaries built successfully")
+}
+
+func findProjectRoot() (string, error) {
+	// Start from current working directory
+	dir, err := os.Getwd()
+	if err != nil {
+		return "", err
+	}
+
+	// Walk up the directory tree until we find go.mod
+	for {
+		if _, err := os.Stat(filepath.Join(dir, "go.mod")); err == nil {
+			return dir, nil
+		}
+
+		parent := filepath.Dir(dir)
+		if parent == dir {
+			// Reached root directory
+			return "", fmt.Errorf("go.mod not found in any parent directory")
+		}
+		dir = parent
+	}
 }
 
 func buildAgent(projectRoot string, target BuildTarget) error {
 	log.Printf("Building agent for %s/%s...", target.GOOS, target.GOARCH)
 
 	// Create output directory
-	outDir := filepath.Join(projectRoot, "build", "agent", fmt.Sprintf("%s-%s", target.GOOS, target.GOARCH))
+	outDir := filepath.Join(projectRoot, "build", "agent")
 	if err := os.MkdirAll(outDir, 0755); err != nil {
 		return fmt.Errorf("failed to create output directory: %w", err)
 	}
 
-	// Output binary path
-	outPath := filepath.Join(outDir, "taskfly-agent")
+	// Output binary path - format: taskfly-agent-{os}-{arch}
+	outPath := filepath.Join(outDir, fmt.Sprintf("taskfly-agent-%s-%s", target.GOOS, target.GOARCH))
 
-	// Source file
-	srcPath := filepath.Join(projectRoot, "cmd", "taskfly-agent", "main.go")
+	// Source directory (build the whole package, not just main.go)
+	srcPath := filepath.Join(projectRoot, "cmd", "taskfly-agent")
 
 	// Build command
 	cmd := exec.Command("go", "build", "-ldflags=-s -w", "-o", outPath, srcPath)
@@ -99,5 +122,32 @@ func buildAgent(projectRoot string, target BuildTarget) error {
 	}
 
 	log.Printf("✓ Built agent for %s/%s", target.GOOS, target.GOARCH)
+	return nil
+}
+
+func copyAgentsForEmbedding(projectRoot string) error {
+	srcDir := filepath.Join(projectRoot, "build", "agent")
+	destDir := filepath.Join(projectRoot, "cmd", "taskflyd", "agents")
+
+	// Create destination directory
+	if err := os.MkdirAll(destDir, 0755); err != nil {
+		return fmt.Errorf("failed to create agents directory: %w", err)
+	}
+
+	// Copy each agent binary
+	for _, target := range targets {
+		srcFile := filepath.Join(srcDir, fmt.Sprintf("taskfly-agent-%s-%s", target.GOOS, target.GOARCH))
+		destFile := filepath.Join(destDir, fmt.Sprintf("taskfly-agent-%s-%s", target.GOOS, target.GOARCH))
+
+		data, err := os.ReadFile(srcFile)
+		if err != nil {
+			return fmt.Errorf("failed to read %s: %w", srcFile, err)
+		}
+
+		if err := os.WriteFile(destFile, data, 0755); err != nil {
+			return fmt.Errorf("failed to write %s: %w", destFile, err)
+		}
+	}
+
 	return nil
 }

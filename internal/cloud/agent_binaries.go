@@ -7,23 +7,18 @@ import (
 	"runtime"
 )
 
-// Agent binaries are loaded from the build directory at runtime
-// We don't embed them to avoid bloating the daemon binary
+// Agent binaries are embedded in the daemon binary and extracted at runtime
+// The daemon extracts agents to build/agent/ on startup
 
 // GetAgentBinary returns the appropriate agent binary for the requested platform
 func GetAgentBinary(goos, goarch string) ([]byte, error) {
-	// Find the project root by looking for go.mod
-	projectRoot, err := findProjectRoot()
-	if err != nil {
-		return nil, fmt.Errorf("failed to find project root: %w", err)
-	}
-
-	// Construct path to agent binary
-	binaryPath := filepath.Join(projectRoot, "build", "agent", fmt.Sprintf("%s-%s", goos, goarch), "taskfly-agent")
+	// Agent binaries are extracted by the daemon to build/agent/ relative to working directory
+	// The filename format matches what the build script creates: taskfly-agent-{os}-{arch}
+	binaryPath := filepath.Join("build", "agent", fmt.Sprintf("taskfly-agent-%s-%s", goos, goarch))
 
 	// Check if binary exists
 	if _, err := os.Stat(binaryPath); os.IsNotExist(err) {
-		return nil, fmt.Errorf("agent binary not found at %s. Run 'go generate ./internal/cloud' to build agent binaries", binaryPath)
+		return nil, fmt.Errorf("agent binary not found at %s. The daemon should have extracted it on startup", binaryPath)
 	}
 
 	// Read the binary
@@ -33,26 +28,6 @@ func GetAgentBinary(goos, goarch string) ([]byte, error) {
 	}
 
 	return data, nil
-}
-
-// findProjectRoot finds the project root by walking up directories looking for go.mod
-func findProjectRoot() (string, error) {
-	dir, err := os.Getwd()
-	if err != nil {
-		return "", err
-	}
-
-	for {
-		if _, err := os.Stat(filepath.Join(dir, "go.mod")); err == nil {
-			return dir, nil
-		}
-
-		parent := filepath.Dir(dir)
-		if parent == dir {
-			return "", fmt.Errorf("go.mod not found")
-		}
-		dir = parent
-	}
 }
 
 // GetAgentBinaryForCurrentPlatform returns the agent binary for the current platform

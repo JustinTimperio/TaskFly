@@ -45,24 +45,29 @@ func GenerateNodeConfigs(nodesConfig NodesConfig, deploymentID string) ([]NodeCo
 			nodeConfig.Config[key] = value
 		}
 
-		// Distribute list items to this node
+		// Distribute list items to this node in round-robin fashion
 		for listName, listItems := range nodesConfig.DistributedLists {
-			var item interface{}
-			if len(listItems) > i {
-				item = listItems[i]
-			} else if len(listItems) > 0 {
-				// If we have more nodes than list items, cycle through the list
-				item = listItems[i%len(listItems)]
-			} else {
+			if len(listItems) == 0 {
 				continue
 			}
 
-			// Only allow simple types (strings, numbers, booleans)
-			switch v := item.(type) {
-			case string, int, int64, float64, bool:
-				nodeConfig.Config[listName] = v
-			default:
-				return nil, fmt.Errorf("distributed list '%s' contains complex type %T - only simple types (string, int, float, bool) are supported", listName, v)
+			// Collect all items that should go to this node (round-robin)
+			var nodeItems []interface{}
+			for itemIndex := i; itemIndex < len(listItems); itemIndex += nodesConfig.Count {
+				item := listItems[itemIndex]
+
+				// Only allow simple types (strings, numbers, booleans)
+				switch item.(type) {
+				case string, int, int64, float64, bool:
+					nodeItems = append(nodeItems, item)
+				default:
+					return nil, fmt.Errorf("distributed list '%s' contains complex type %T - only simple types (string, int, float, bool) are supported", listName, item)
+				}
+			}
+
+			// Always store as array for consistency
+			if len(nodeItems) > 0 {
+				nodeConfig.Config[listName] = nodeItems
 			}
 		}
 
@@ -91,8 +96,16 @@ func processSimpleTemplate(value interface{}, nodeConfig NodeConfig) interface{}
 		result = strings.ReplaceAll(result, "{deployment_id}", nodeConfig.DeploymentID)
 
 		// Replace references to global metadata and distributed lists
+		// If the entire string is just a placeholder, return the actual value (not stringified)
 		for key, val := range nodeConfig.Config {
 			placeholder := fmt.Sprintf("{%s}", key)
+
+			// If the entire string is just this placeholder, return the raw value
+			if result == placeholder {
+				return val
+			}
+
+			// Otherwise do string replacement for simple types embedded in strings
 			switch v := val.(type) {
 			case string:
 				result = strings.ReplaceAll(result, placeholder, v)

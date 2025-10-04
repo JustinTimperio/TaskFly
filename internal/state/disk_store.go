@@ -15,6 +15,8 @@ type DiskStore struct {
 	deployments map[string]*Deployment
 	nodes       map[string]*Node
 	nodesByDep  map[string][]*Node
+	logs        map[string][]LogEntry // In-memory only, not persisted
+	maxLogsPerDeployment int
 	dataDir     string
 }
 
@@ -35,6 +37,8 @@ func NewDiskStore(dataDir string) (*DiskStore, error) {
 		deployments: make(map[string]*Deployment),
 		nodes:       make(map[string]*Node),
 		nodesByDep:  make(map[string][]*Node),
+		logs:        make(map[string][]LogEntry),
+		maxLogsPerDeployment: 10000,
 		dataDir:     dataDir,
 	}
 
@@ -467,9 +471,108 @@ func (s *DiskStore) GetStats() map[string]interface{} {
 		statusCounts[dep.Status]++
 	}
 
+	totalLogs := 0
+	for _, logs := range s.logs {
+		totalLogs += len(logs)
+	}
+
 	return map[string]interface{}{
 		"total_deployments": len(s.deployments),
 		"total_nodes":       len(s.nodes),
+		"total_logs":        totalLogs,
 		"deployment_status": statusCounts,
 	}
+}
+
+// AppendLogs adds log entries for a deployment (in-memory only, not persisted)
+func (s *DiskStore) AppendLogs(deploymentID string, logs []LogEntry) error {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+
+	// Verify deployment exists
+	if _, exists := s.deployments[deploymentID]; !exists {
+		return fmt.Errorf("deployment %s not found", deploymentID)
+	}
+
+	// Get existing logs
+	existingLogs := s.logs[deploymentID]
+
+	// Append new logs
+	existingLogs = append(existingLogs, logs...)
+
+	// Trim to max size (keep most recent)
+	if len(existingLogs) > s.maxLogsPerDeployment {
+		existingLogs = existingLogs[len(existingLogs)-s.maxLogsPerDeployment:]
+	}
+
+	s.logs[deploymentID] = existingLogs
+	return nil
+}
+
+// GetLogs retrieves logs for a deployment, optionally filtered by node and time
+func (s *DiskStore) GetLogs(deploymentID string, nodeID string, since time.Time, limit int) ([]LogEntry, error) {
+	s.mu.RLock()
+	defer s.mu.RUnlock()
+
+	// Verify deployment exists
+	if _, exists := s.deployments[deploymentID]; !exists {
+		return nil, fmt.Errorf("deployment %s not found", deploymentID)
+	}
+
+	allLogs := s.logs[deploymentID]
+	if allLogs == nil {
+		return []LogEntry{}, nil
+	}
+
+	// Filter logs
+	var filtered []LogEntry
+	for _, log := range allLogs {
+		// Filter by node if specified
+		if nodeID != "" && log.NodeID != nodeID {
+			continue
+		}
+		// Filter by time if specified
+		if !since.IsZero() && log.Timestamp.Before(since) {
+			continue
+		}
+		filtered = append(filtered, log)
+	}
+
+	// Apply limit
+	if limit > 0 && len(filtered) > limit {
+		filtered = filtered[len(filtered)-limit:]
+	}
+
+	return filtered, nil
+}
+
+// ClearLogs removes all logs for a deployment
+func (s *DiskStore) ClearLogs(deploymentID string) error {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+
+	delete(s.logs, deploymentID)
+	return nil
+}
+
+// UpdateNodeMetrics updates the metrics for a node (not persisted to disk)
+func (s *DiskStore) UpdateNodeMetrics(deploymentID, nodeID string, metrics *SystemMetrics) error {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+
+	node, exists := s.nodes[nodeID]
+	if !exists {
+		return fmt.Errorf("node %s not found", nodeID)
+	}
+
+	if node.DeploymentID != deploymentID {
+		return fmt.Errorf("node %s does not belong to deployment %s", nodeID, deploymentID)
+	}
+
+	metrics.Timestamp = time.Now()
+	node.Metrics = metrics
+	node.LastUpdate = time.Now()
+
+	// Note: Metrics are not persisted to disk to avoid excessive I/O
+	return nil
 }

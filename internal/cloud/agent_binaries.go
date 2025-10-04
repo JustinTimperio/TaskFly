@@ -16,6 +16,11 @@ func GetAgentBinary(goos, goarch string) ([]byte, error) {
 	// The filename format matches what the build script creates: taskfly-agent-{os}-{arch}
 	binaryPath := filepath.Join("build", "agent", fmt.Sprintf("taskfly-agent-%s-%s", goos, goarch))
 
+	// Add .exe extension for Windows
+	if goos == "windows" {
+		binaryPath += ".exe"
+	}
+
 	// Check if binary exists
 	if _, err := os.Stat(binaryPath); os.IsNotExist(err) {
 		return nil, fmt.Errorf("agent binary not found at %s. The daemon should have extracted it on startup", binaryPath)

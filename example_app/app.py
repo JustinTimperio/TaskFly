@@ -5,6 +5,7 @@ Example TaskFly application
 
 import os
 import time
+import random
 
 
 def main():
@@ -20,7 +21,7 @@ def main():
     batch_start = os.environ.get("BATCH_START", "0")
     batch_end = os.environ.get("BATCH_END", "0")
 
-    print(f"🚀 TaskFly Enhanced Worker Starting!")
+    print(f"🚀 TaskFly Example Worker Starting!")
     print(f"━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━")
     print(f"Worker ID: {worker_id}")
     print(f"Worker Index: {worker_index}/{total_workers}")
@@ -40,7 +41,7 @@ def main():
         print(
             f"Worker {worker_index}: Processing step {i+1}/5 (items {int(batch_start) + i*batch_size//5} - {int(batch_start) + (i+1)*batch_size//5})..."
         )
-        time.sleep(2)
+        time.sleep(random.randint(1, 5))
 
     print(f"✅ Worker {worker_index}: Task completed successfully!")
     print(f"📤 Results saved to: {output_path}")

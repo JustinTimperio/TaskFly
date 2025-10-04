@@ -14,6 +14,7 @@ import (
 	"path/filepath"
 	"time"
 
+	"github.com/JustinTimperio/TaskFly/internal/validation"
 	"github.com/chzyer/readline"
 	"github.com/pterm/pterm"
 	"github.com/sirupsen/logrus"
@@ -130,6 +131,19 @@ func main() {
 				Action: deployCommand,
 			},
 			{
+				Name:   "validate",
+				Usage:  "Validate taskfly.yml configuration",
+				Action: validateCommand,
+				Flags: []cli.Flag{
+					&cli.StringFlag{
+						Name:    "config",
+						Aliases: []string{"c"},
+						Usage:   "Path to taskfly.yml config file",
+						Value:   "taskfly.yml",
+					},
+				},
+			},
+			{
 				Name:   "list",
 				Usage:  "List all deployments",
 				Action: listCommand,
@@ -203,6 +217,72 @@ func getDaemonURL(c *cli.Context) string {
 	ip := c.String("daemon-ip")
 	port := c.String("daemon-port")
 	return fmt.Sprintf("http://%s:%s", ip, port)
+}
+
+func validateCommand(c *cli.Context) error {
+	configPath := c.String("config")
+
+	pterm.DefaultSection.Printfln("Validating configuration: %s", configPath)
+	fmt.Println()
+
+	// Check if config file exists
+	if _, err := os.Stat(configPath); os.IsNotExist(err) {
+		pterm.Error.Printfln("Config file not found: %s", configPath)
+		return fmt.Errorf("config file not found")
+	}
+
+	// Create validator
+	validator, err := validation.NewValidator(configPath)
+	if err != nil {
+		pterm.Error.Printfln("Failed to parse config: %v", err)
+		return err
+	}
+
+	// Run validation
+	result := validator.Validate()
+
+	// Display results
+	hasIssues := false
+
+	if len(result.Errors) > 0 {
+		hasIssues = true
+		pterm.DefaultSection.WithLevel(2).Println("Errors")
+		for _, err := range result.Errors {
+			pterm.Error.Printf("  %s: %s\n", pterm.FgRed.Sprint(err.Field), err.Message)
+		}
+		fmt.Println()
+	}
+
+	if len(result.Warnings) > 0 {
+		hasIssues = true
+		pterm.DefaultSection.WithLevel(2).Println("Warnings")
+		for _, warn := range result.Warnings {
+			pterm.Warning.Printf("  %s: %s\n", pterm.FgYellow.Sprint(warn.Field), warn.Message)
+		}
+		fmt.Println()
+	}
+
+	if len(result.Info) > 0 {
+		pterm.DefaultSection.WithLevel(2).Println("Info")
+		for _, info := range result.Info {
+			pterm.Info.Printf("  %s: %s\n", pterm.FgCyan.Sprint(info.Field), info.Message)
+		}
+		fmt.Println()
+	}
+
+	// Summary
+	if result.Valid && !hasIssues {
+		pterm.Success.Println("✓ Configuration is valid! No issues found.")
+		return nil
+	} else if result.Valid {
+		pterm.Success.Printfln("✓ Configuration is valid (%d warnings, %d info messages)",
+			len(result.Warnings), len(result.Info))
+		return nil
+	} else {
+		pterm.Error.Printfln("✗ Configuration is invalid (%d errors, %d warnings)",
+			len(result.Errors), len(result.Warnings))
+		return fmt.Errorf("validation failed")
+	}
 }
 
 func deployCommand(c *cli.Context) error {
@@ -766,6 +846,21 @@ func shellCommand(c *cli.Context) error {
 				pterm.Error.Println(err)
 			}
 
+		case "validate":
+			configFile := "taskfly.yml"
+			if len(parts) > 1 {
+				configFile = parts[1]
+			}
+
+			set := flag.NewFlagSet("validate", flag.ContinueOnError)
+			set.String("config", configFile, "")
+			tempCtx := cli.NewContext(c.App, set, c)
+			set.Parse([]string{})
+
+			if err := validateCommand(tempCtx); err != nil {
+				pterm.Error.Println(err)
+			}
+
 		case "dashboard", "dash":
 			// Dashboard in shell just shows it once
 			// For continuous updates, use the standalone dashboard command
@@ -799,6 +894,7 @@ func printShellHelp() {
 		{"status <id>", "Show detailed status of a deployment"},
 		{"logs <id> [--node <node-id>] [--follow]", "View logs from a deployment"},
 		{"up, deploy", "Deploy from taskfly.yml in current directory"},
+		{"validate [config]", "Validate taskfly.yml configuration"},
 		{"down <id>", "Terminate a deployment"},
 		{"clear", "Clear the screen"},
 		{"help", "Show this help message"},

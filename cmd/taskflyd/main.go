@@ -34,6 +34,9 @@ var agentLinuxAmd64 []byte
 //go:embed agents/taskfly-agent-linux-arm64
 var agentLinuxArm64 []byte
 
+//go:embed agents/taskfly-agent-windows-amd64.exe
+var agentWindowsAmd64 []byte
+
 // Global instances
 var (
 	store         state.StateStore
@@ -104,10 +107,11 @@ func extractEmbeddedAgents() error {
 	}
 
 	agents := map[string][]byte{
-		"taskfly-agent-darwin-amd64": agentDarwinAmd64,
-		"taskfly-agent-darwin-arm64": agentDarwinArm64,
-		"taskfly-agent-linux-amd64":  agentLinuxAmd64,
-		"taskfly-agent-linux-arm64":  agentLinuxArm64,
+		"taskfly-agent-darwin-amd64":      agentDarwinAmd64,
+		"taskfly-agent-darwin-arm64":      agentDarwinArm64,
+		"taskfly-agent-linux-amd64":       agentLinuxAmd64,
+		"taskfly-agent-linux-arm64":       agentLinuxArm64,
+		"taskfly-agent-windows-amd64.exe": agentWindowsAmd64,
 	}
 
 	for name, data := range agents {

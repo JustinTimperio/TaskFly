@@ -19,6 +19,7 @@ var targets = []BuildTarget{
 	{"linux", "arm64"},
 	{"darwin", "amd64"},
 	{"darwin", "arm64"},
+	{"windows", "amd64"},
 }
 
 func main() {
@@ -102,6 +103,9 @@ func buildAgent(projectRoot string, target BuildTarget) error {
 
 	// Output binary path - format: taskfly-agent-{os}-{arch}
 	outPath := filepath.Join(outDir, fmt.Sprintf("taskfly-agent-%s-%s", target.GOOS, target.GOARCH))
+	if target.GOOS == "windows" {
+		outPath += ".exe"
+	}
 
 	// Source directory (build the whole package, not just main.go)
 	srcPath := filepath.Join(projectRoot, "cmd", "taskfly-agent")
@@ -138,6 +142,10 @@ func copyAgentsForEmbedding(projectRoot string) error {
 	for _, target := range targets {
 		srcFile := filepath.Join(srcDir, fmt.Sprintf("taskfly-agent-%s-%s", target.GOOS, target.GOARCH))
 		destFile := filepath.Join(destDir, fmt.Sprintf("taskfly-agent-%s-%s", target.GOOS, target.GOARCH))
+		if target.GOOS == "windows" {
+			srcFile += ".exe"
+			destFile += ".exe"
+		}
 
 		data, err := os.ReadFile(srcFile)
 		if err != nil {

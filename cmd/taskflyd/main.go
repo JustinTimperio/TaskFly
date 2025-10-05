@@ -22,6 +22,7 @@ import (
 )
 
 // Embed agent binaries (paths must be relative to this package directory)
+//
 //go:embed agents/taskfly-agent-darwin-amd64
 var agentDarwinAmd64 []byte
 
@@ -99,6 +100,7 @@ func main() {
 		logrus.Fatal(err)
 	}
 }
+
 // extractEmbeddedAgents writes the embedded agent binaries to the build/agent directory
 func extractEmbeddedAgents() error {
 	agentDir := "build/agent"
@@ -590,7 +592,7 @@ func nodeHeartbeat(c echo.Context) error {
 		// Non-critical, so we don't return an error to the agent
 	}
 
-	// Update node status to running_script if it's not already in a terminal state
+	// Update node status to running if it's not already in a terminal state
 	// Don't overwrite completed/failed/terminated states
 	if node.Status != state.NodeStatusRunning &&
 		node.Status != state.NodeStatusCompleted &&

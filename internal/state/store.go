@@ -28,7 +28,7 @@ const (
 	NodeStatusBooting      NodeStatus = "booting"
 	NodeStatusRegistering  NodeStatus = "registering"
 	NodeStatusDownloading  NodeStatus = "downloading_assets"
-	NodeStatusRunning      NodeStatus = "running_script"
+	NodeStatusRunning      NodeStatus = "running"
 	NodeStatusCompleted    NodeStatus = "completed"
 	NodeStatusFailed       NodeStatus = "failed"
 	NodeStatusTerminating  NodeStatus = "terminating"
@@ -46,13 +46,13 @@ type LogEntry struct {
 
 // SystemMetrics represents system resource metrics from a node
 type SystemMetrics struct {
-	CPUCores    int     `json:"cpu_cores"`
-	CPUUsage    float64 `json:"cpu_usage"`
-	MemoryTotal uint64  `json:"memory_total"`
-	MemoryUsed  uint64  `json:"memory_used"`
-	LoadAvg1    float64  `json:"load_avg_1"`
-	LoadAvg5    float64 `json:"load_avg_5"`
-	LoadAvg15   float64 `json:"load_avg_15"`
+	CPUCores    int       `json:"cpu_cores"`
+	CPUUsage    float64   `json:"cpu_usage"`
+	MemoryTotal uint64    `json:"memory_total"`
+	MemoryUsed  uint64    `json:"memory_used"`
+	LoadAvg1    float64   `json:"load_avg_1"`
+	LoadAvg5    float64   `json:"load_avg_5"`
+	LoadAvg15   float64   `json:"load_avg_15"`
 	Timestamp   time.Time `json:"timestamp"`
 }
 
@@ -119,21 +119,21 @@ type StateStore interface {
 
 // Store manages all deployment and node state in memory
 type Store struct {
-	mu          sync.RWMutex
-	deployments map[string]*Deployment
-	nodes       map[string]*Node   // key is node_id
-	nodesByDep  map[string][]*Node // key is deployment_id
-	logs        map[string][]LogEntry // key is deployment_id, circular buffer
+	mu                   sync.RWMutex
+	deployments          map[string]*Deployment
+	nodes                map[string]*Node      // key is node_id
+	nodesByDep           map[string][]*Node    // key is deployment_id
+	logs                 map[string][]LogEntry // key is deployment_id, circular buffer
 	maxLogsPerDeployment int
 }
 
 // NewStore creates a new in-memory state store
 func NewStore() *Store {
 	return &Store{
-		deployments: make(map[string]*Deployment),
-		nodes:       make(map[string]*Node),
-		nodesByDep:  make(map[string][]*Node),
-		logs:        make(map[string][]LogEntry),
+		deployments:          make(map[string]*Deployment),
+		nodes:                make(map[string]*Node),
+		nodesByDep:           make(map[string][]*Node),
+		logs:                 make(map[string][]LogEntry),
 		maxLogsPerDeployment: 10000, // Keep last 10K log entries per deployment
 	}
 }

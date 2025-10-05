@@ -6,6 +6,26 @@ Example TaskFly application
 import os
 import time
 import random
+import sys
+
+
+class Unbuffered(object):
+    def __init__(self, stream):
+        self.stream = stream
+
+    def write(self, data):
+        self.stream.write(data)
+        self.stream.flush()
+
+    def writelines(self, datas):
+        self.stream.writelines(datas)
+        self.stream.flush()
+
+    def __getattr__(self, attr):
+        return getattr(self.stream, attr)
+
+
+sys.stdout = Unbuffered(sys.stdout)
 
 
 def main():
@@ -20,6 +40,8 @@ def main():
     output_path = os.environ.get("OUTPUT_PATH", "unknown")
     batch_start = os.environ.get("BATCH_START", "0")
     batch_end = os.environ.get("BATCH_END", "0")
+
+    time.sleep(random.randint(1, 10))
 
     print(f"🚀 TaskFly Example Worker Starting!")
     print(f"━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━")
@@ -41,7 +63,7 @@ def main():
         print(
             f"Worker {worker_index}: Processing step {i+1}/5 (items {int(batch_start) + i*batch_size//5} - {int(batch_start) + (i+1)*batch_size//5})..."
         )
-        time.sleep(random.randint(1, 5))
+        time.sleep(random.randint(1, 10))
 
     print(f"✅ Worker {worker_index}: Task completed successfully!")
     print(f"📤 Results saved to: {output_path}")

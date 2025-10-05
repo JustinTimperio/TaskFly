@@ -39,6 +39,12 @@ type MetricsResponse struct {
 }
 
 func dashboardCommand(c *cli.Context) error {
+	// Check if TUI mode is requested
+	if c.Bool("tui") {
+		return runDashboardTUI(c)
+	}
+
+	// Default to simple dashboard
 	// Auto-refresh every 3 seconds
 	for {
 		if err := showDashboard(c); err != nil {

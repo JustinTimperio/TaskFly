@@ -203,6 +203,13 @@ func main() {
 				Aliases: []string{"dash"},
 				Usage:   "Show the deployment dashboard",
 				Action:  dashboardCommand,
+				Flags: []cli.Flag{
+					&cli.BoolFlag{
+						Name:    "tui",
+						Usage:   "Use the enhanced TUI dashboard with charts and gauges",
+						Aliases: []string{"t"},
+					},
+				},
 			},
 		},
 	}
@@ -646,9 +653,45 @@ func createBundle(config *TaskFlyConfig) (string, error) {
 	}
 
 	// Add application files
-	for _, filePath := range config.ApplicationFiles {
-		if err := addFileToTar(tarWriter, filePath); err != nil {
-			return "", fmt.Errorf("failed to add %s: %w", filePath, err)
+	for _, pattern := range config.ApplicationFiles {
+		// Expand glob patterns
+		matches, err := filepath.Glob(pattern)
+		if err != nil {
+			return "", fmt.Errorf("invalid glob pattern %s: %w", pattern, err)
+		}
+
+		// If no matches, try as literal path (could be a directory)
+		if len(matches) == 0 {
+			matches = []string{pattern}
+		}
+
+		for _, filePath := range matches {
+			// Check if it's a directory
+			info, err := os.Stat(filePath)
+			if err != nil {
+				return "", fmt.Errorf("failed to stat %s: %w", filePath, err)
+			}
+
+			if info.IsDir() {
+				// Walk directory and add all files
+				err := filepath.Walk(filePath, func(path string, info os.FileInfo, err error) error {
+					if err != nil {
+						return err
+					}
+					if !info.IsDir() {
+						return addFileToTar(tarWriter, path)
+					}
+					return nil
+				})
+				if err != nil {
+					return "", fmt.Errorf("failed to add directory %s: %w", filePath, err)
+				}
+			} else {
+				// Add single file
+				if err := addFileToTar(tarWriter, filePath); err != nil {
+					return "", fmt.Errorf("failed to add %s: %w", filePath, err)
+				}
+			}
 		}
 	}
 

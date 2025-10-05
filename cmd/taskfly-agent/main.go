@@ -173,7 +173,7 @@ func (a *Agent) Run() error {
 	// Execute setup script if it exists
 	setupScript := filepath.Join(a.workDir, "setup.sh")
 	if _, err := os.Stat(setupScript); err == nil {
-		if err := a.updateStatus("running_script", "Executing deployment script"); err != nil {
+		if err := a.updateStatus("running", "Executing deployment script"); err != nil {
 			log.Printf("Failed to update status: %v", err)
 		}
 
@@ -472,6 +472,11 @@ func (a *Agent) extractBundle(path string) error {
 				return fmt.Errorf("failed to create directory %s: %w", target, err)
 			}
 		case tar.TypeReg:
+			// Ensure parent directory exists
+			if err := os.MkdirAll(filepath.Dir(target), 0755); err != nil {
+				return fmt.Errorf("failed to create parent directory for %s: %w", target, err)
+			}
+
 			outFile, err := os.OpenFile(target, os.O_CREATE|os.O_WRONLY|os.O_TRUNC, os.FileMode(header.Mode))
 			if err != nil {
 				return fmt.Errorf("failed to create file %s: %w", target, err)
